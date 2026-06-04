@@ -1,0 +1,24 @@
+[package]
+name = "ur_redis_driver"
+version = "0.1.0"
+authors = ["Martin Dahl <martin.dahl@gmail.com>", "Endre Eros <endre90@gmail.com>"]
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7.0", features = ["full"] }
+futures = "0.3.5"
+bytes = "0.5.4"
+hex = "0.4.2"
+lazy_static = "1.4.0"
+snailquote = "0.3.0"
+rand = "0.8.4"
+k = "0.32.0"
+log = "0.4.22"
+tera = "1.20.0"
+urdf-rs = "0.9.0"
+tempfile = "3.17.1"
+ordered-float = {version = "3.4.0", features = ["serde"] }
+serde_json = "1.0.127"
+serde = { version = "1.0.217", features = ["derive"] }
+micro_sp = { git = "ssh://git@github.com/endre90/micro_sp.git", branch = "master" }
