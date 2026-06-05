@@ -12,9 +12,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LinesCodec};
 use tokio_util::task::LocalPoolHandle;
-use ur_redis_driver::RobotCommand;
-
-
+use ur_redis_driver::{DriverState, RobotCommand, generate_ur_script};
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum DashboardCommand {
@@ -67,46 +65,6 @@ fn publish_script_result(uuid: &str, success: bool) {
     println!("Script [{}] Result: {}", uuid, success);
 }
 
-// ============================================================================
-// DRIVER IMPLEMENTATION
-// ============================================================================
-
-struct DriverState {
-    running: bool,
-    connected: bool,
-    goal_id: Option<String>,
-    goal_sender: Option<oneshot::Sender<bool>>,
-    handshake_sender: Option<oneshot::Sender<bool>>,
-    feedback_sender: Option<mpsc::Sender<String>>,
-    robot_state: i32,
-    program_state: i32,
-    joint_values: Vec<f64>,
-    joint_speeds: Vec<f64>,
-    digital_inputs: u32,
-    digital_outputs: u32,
-    forces: Vec<f64>,
-}
-
-impl DriverState {
-    fn new() -> Self {
-        DriverState {
-            running: true,
-            connected: false,
-            goal_id: None,
-            goal_sender: None,
-            handshake_sender: None,
-            feedback_sender: None,
-            robot_state: 0,
-            program_state: 0,
-            joint_values: vec![],
-            joint_speeds: vec![],
-            digital_inputs: 0,
-            digital_outputs: 0,
-            forces: vec![],
-        }
-    }
-}
-
 async fn handle_dashboard_commands_loop(
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -116,7 +74,7 @@ async fn handle_dashboard_commands_loop(
             let (sender, future) = oneshot::channel();
             if dashboard_commands.try_send((cmd, sender)).is_ok() {
                 let _ok = future.await.unwrap_or(false);
-                // Handle reply to your interface if needed
+                // Handle reply to interface if needed
             }
         } else {
             break;

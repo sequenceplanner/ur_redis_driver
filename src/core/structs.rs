@@ -1,8 +1,45 @@
 use std::fmt;
+use tokio::sync::{mpsc, oneshot};
 
 use micro_sp::*;
 use serde::{Deserialize, Serialize};
 // use tokio::sync::oneshot;
+
+pub struct DriverState {
+    pub running: bool,
+    pub connected: bool,
+    pub goal_id: Option<String>,
+    pub goal_sender: Option<oneshot::Sender<bool>>,
+    pub handshake_sender: Option<oneshot::Sender<bool>>,
+    pub feedback_sender: Option<mpsc::Sender<String>>,
+    pub robot_state: i32,
+    pub program_state: i32,
+    pub joint_values: Vec<f64>,
+    pub joint_speeds: Vec<f64>,
+    pub digital_inputs: u32,
+    pub digital_outputs: u32,
+    pub forces: Vec<f64>,
+}
+
+impl DriverState {
+    pub fn new() -> Self {
+        DriverState {
+            running: true,
+            connected: false,
+            goal_id: None,
+            goal_sender: None,
+            handshake_sender: None,
+            feedback_sender: None,
+            robot_state: 0,
+            program_state: 0,
+            joint_values: vec![],
+            joint_speeds: vec![],
+            digital_inputs: 0,
+            digital_outputs: 0,
+            forces: vec![],
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum CommandType {
