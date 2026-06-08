@@ -87,7 +87,6 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     state
 }
 
-
 pub fn generate_gripper_interface_state(gripper_id: &str, log_target: &str) -> State {
     let state = State::new();
 

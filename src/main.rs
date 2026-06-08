@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LinesCodec};
 use tokio_util::task::LocalPoolHandle;
-use ur_redis_driver::{DriverState, RobotCommand, generate_ur_script};
+use ur_redis_driver::{DriverState, RobotCommand, UR_DRIVER_SOCKET_PORT, generate_ur_script};
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum DashboardCommand {
@@ -41,6 +41,25 @@ async fn wait_for_script_request() -> Option<ScriptRequest> {
 
 /// TODO: Implement this to publish/send joint states to your custom system.
 async fn publish_joint_states(joints: &[f64], speeds: &[f64]) {
+    println!("Joints: {:?}", joints);
+}
+
+async fn publish_robot_transforms(chain: &k::Chain<f64>, joints: &[f64]) {
+    let current_joint_states = joints.to_vec();
+    chain.set_joint_positions(&current_joint_states).unwrap();
+    chain.update_transforms();
+
+    for node in chain.iter() {
+        let frame_name = node.joint().name.clone();
+        
+        // This returns a nalgebra::Isometry3 representing the pose
+        let transform = node.world_transform().unwrap();
+        
+        println!("Frame: {}", frame_name);
+        println!("Translation [X, Y, Z]: {:?}", transform.translation);
+        println!("Rotation (Euler): {:?}", transform.rotation);
+        println!("---");
+    }
     println!("Joints: {:?}", joints);
 }
 
@@ -468,6 +487,9 @@ async fn realtime_reader(
 async fn state_publisher(
     driver_state: Arc<Mutex<DriverState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+
+    let chain: k::Chain<f64> = k::Chain::<f64>::from_urdf_file("src/urdf/ur20.urdf").unwrap();
+
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
@@ -486,6 +508,7 @@ async fn state_publisher(
 
         // Call the boilerplate hook functions
         publish_joint_states(&joints, &speeds).await;
+        publish_robot_transforms(&chain, &joints).await;
         publish_measured_state(state, prog_state, &forces, inputs, outputs).await;
     }
 }
