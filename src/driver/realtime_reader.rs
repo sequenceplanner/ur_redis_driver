@@ -8,7 +8,6 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::DriverState;
-// use ur_redis_driver::{DriverState, RobotCommand, UR_DRIVER_SOCKET_PORT, generate_ur_script};
 
 pub async fn realtime_reader(
     driver_state: Arc<Mutex<DriverState>>,

@@ -1,13 +1,11 @@
 use futures::FutureExt;
 use futures::future::{self, Either};
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
-use tokio_util::task::LocalPoolHandle;
 
 use crate::interfaces::command_server::{publish_script_feedback, publish_script_result};
 use crate::{DashboardCommand, DriverState, ScriptRequest, generate_ur_script};
