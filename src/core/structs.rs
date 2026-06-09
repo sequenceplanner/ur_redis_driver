@@ -5,6 +5,17 @@ use micro_sp::*;
 use serde::{Deserialize, Serialize};
 // use tokio::sync::oneshot;
 
+#[derive(Clone, PartialEq, Debug)]
+pub enum DashboardCommand {
+    Stop,
+    ResetProtectiveStop,
+}
+
+pub struct ScriptRequest {
+    pub uuid: String,
+    pub script: String,
+}
+
 pub struct DriverState {
     pub running: bool,
     pub connected: bool,
@@ -149,7 +160,7 @@ pub struct RobotCommand {
     pub force_threshold: f64,
     // pub gripper_velocity: f64,
     // pub gripper_force: f64,
-    // pub gripper_ref_pos_percentage: i64, 
+    // pub gripper_ref_pos_percentage: i64,
     // pub gripper_position: i64 // open: 100, closed: 0, or anything inbetween
 }
 
@@ -259,7 +270,10 @@ pub fn transform_to_string(tf_stamped: &SPTransformStamped) -> String {
 }
 
 pub fn pose_to_string(pose: [f64; 6]) -> String {
-    format!("p[{},{},{},{},{},{}]", pose[0], pose[1], pose[2], pose[3], pose[4], pose[5])
+    format!(
+        "p[{},{},{},{},{},{}]",
+        pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]
+    )
 }
 
 pub struct URDFParameters {
