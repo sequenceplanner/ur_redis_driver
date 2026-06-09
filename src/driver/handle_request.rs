@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tokio_util::task::LocalPoolHandle;
 
+use crate::interfaces::command_server::{publish_script_feedback, publish_script_result};
 use crate::{DashboardCommand, DriverState, ScriptRequest, generate_ur_script};
 
 pub async fn handle_request(
@@ -17,7 +18,7 @@ pub async fn handle_request(
     driver_state: Arc<Mutex<DriverState>>,
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
     req: ScriptRequest,
-    mut cancel_receiver: mpsc::Receiver<()>,
+    mut cancel_receiver: mpsc::Receiver<()>, // add this back later
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (goal_sender, goal_receiver) = oneshot::channel::<bool>();
 
@@ -127,88 +128,4 @@ pub async fn handle_request(
     }
 
     Ok(())
-}
-
-pub async fn script_request_server(
-    ur_address: String,
-    local_addr: watch::Receiver<Option<SocketAddr>>,
-    driver_state: Arc<Mutex<DriverState>>,
-    dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let local_pool = LocalPoolHandle::new(1);
-
-    loop {
-        if let Some(req) = wait_for_script_request().await {
-            let local_addr = local_addr.borrow().clone();
-
-            if local_addr.is_none() || !driver_state.lock().unwrap().connected {
-                println!(
-                    "Not connected to robot yet, rejecting request: {}",
-                    req.uuid
-                );
-                publish_script_result(&req.uuid, false);
-                continue;
-            }
-            let local_addr_str = local_addr.unwrap().ip().to_string();
-
-            if driver_state.lock().unwrap().robot_state != 1 {
-                println!("Robot not in normal mode, rejecting request: {}", req.uuid);
-                publish_script_result(&req.uuid, false);
-                continue;
-            }
-
-            if driver_state.lock().unwrap().goal_id.is_some() {
-                println!(
-                    "Already have an active goal, rejecting request: {}",
-                    req.uuid
-                );
-                publish_script_result(&req.uuid, false);
-                continue;
-            }
-
-            println!("Accepting goal request with goal id: {}", req.uuid);
-
-            // Note: If you want cancellation, you must hook `cancel_sender` up to your custom interface.
-            let (_cancel_sender, cancel_receiver) = mpsc::channel(1);
-
-            let task_ur_address = ur_address.clone();
-            let task_dashboard_commands = dashboard_commands.clone();
-            let task_driver_state = driver_state.clone();
-
-            local_pool.spawn_pinned(move || async {
-                let result = handle_request(
-                    task_ur_address,
-                    local_addr_str,
-                    task_driver_state,
-                    task_dashboard_commands,
-                    req,
-                    cancel_receiver,
-                )
-                .await;
-
-                if let Err(e) = result {
-                    println!("Error while handing goal: {}", e);
-                }
-            });
-        } else {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// TODO: Implement this to handle script execution feedback (e.g., standard output/errors).
-fn publish_script_feedback(uuid: &str, feedback: &str) {
-    println!("Script [{}] Feedback: {}", uuid, feedback);
-}
-
-/// TODO: Implement this to handle script completion results.
-fn publish_script_result(uuid: &str, success: bool) {
-    println!("Script [{}] Result: {}", uuid, success);
-}
-
-/// TODO: Implement this to yield new script requests from your custom interface.
-async fn wait_for_script_request() -> Option<ScriptRequest> {
-    // Example: Read from a custom channel or API
-    std::future::pending().await
 }

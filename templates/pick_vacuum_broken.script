@@ -1,0 +1,75 @@
+global move_done = False
+global force_detected = False
+global item_mass_detected = False
+
+def script():
+  set_tcp({{ tcp_in_faceplate }})
+  
+  {%- if use_payload %}
+  set_payload({{ payload }})
+  {%- endif %}
+
+  move_done = False
+  force_detected = False
+  item_mass_detected = False
+  
+  thread move_down_thread():
+    movel(pose_trans(get_forward_kin(), p{{ relative_pose }}), a={{ accelleration }}, v={{ velocity }})
+    move_done = True
+  end
+
+  thread force_monitor_down_thread():
+    while not move_done:
+       force = force()
+        if force > {{ force_threshold }} or force < -{{ force_threshold }}:
+        set_standard_digital_out(0, True) 
+        break
+      end
+      sleep(0.002)
+    end
+  end
+
+  t_move_down = run move_down_thread()
+  t_force_down = run force_monitor_down_thread()
+
+  while not move_done and not force_detected:
+    sleep(0.002)
+  end
+  
+  kill t_move_down
+  kill t_force_down
+  stopj(5.0)
+  sleep(0.5)
+
+  move_done = False
+  force_detected = False
+
+  thread move_up_thread():
+    movel(pose_trans(get_forward_kin(), p{{ relative_pose }}), a={{ accelleration }}, v={{ velocity }})
+    move_done = True
+  end
+
+  thread force_monitor_up_thread():
+    sleep(0.4)
+    while not move_done:
+      force = force()
+        if force > {{ force_threshold }} or force < -{{ force_threshold }}:
+        set_tool_digital_out(1, True) 
+        break
+      end
+      sleep(0.002)
+    end
+  end
+
+  t_move_up = run move_up_thread()
+  t_force_up = run force_monitor_up_thread()
+
+  while not move_done and not force_detected:
+    sleep(0.002)
+  end
+
+  kill t_move_up
+  kill t_force_up
+
+  return move_done
+end

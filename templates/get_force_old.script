@@ -1,0 +1,49 @@
+{% raw %}
+def script():
+#   known_mass_kg = {{ known_payload_mass_kg }}
+
+  # The threshold for detecting a successful pickup
+  # This is the expected change in force (in Newtons) due to the new mass
+  # We use a tolerance of 30% to account for measurement inaccuracies
+#   expected_force_change_newtons = known_mass_kg * 9.81
+#   force_threshold_newtons = expected_force_change_newtons * 0.7
+
+  force = force()
+  socket_send_line("{ \"type\": \"Force\", \"data\": " + to_str(force()) + " }", "secondary_client")
+  socket_send_line(feedback_string)
+
+  return True
+
+  
+#   # Get initial force reading before the move
+#   initial_forces = get_tcp_force()
+#   initial_fz = initial_forces[2]
+  
+#   # Note: The code to perform the move and grip action would go here.
+#   # For this example, we'll assume it has already happened.
+#   sleep(1.0) # Wait for the robot to settle after the action.
+
+#   # 2. Get final force reading after the move and grip
+#   final_forces = get_tcp_force()
+#   final_fz = final_forces[2]
+  
+#   # 3. Calculate the change in force and compare it to the expected value.
+#   force_delta = final_fz - initial_fz
+  
+#   if abs(force_delta) > force_threshold_newtons:
+#     popup("Pickup successful! Measured force change: " + to_str(force_delta) + " N")
+#     return True
+#   else:
+#     popup("Pickup failed. Measured force change: " + to_str(force_delta) + " N")
+#     return False
+#   end
+end
+
+
+# def send_force_feedback():
+#   force = force()
+#   feedback_string = "{ \"type\": \"Force\", \"data\": { "
+#   feedback_string = feedback_string + "\"force\": " + to_str(force_data) + " } }"
+#   send_feedback_to_ros(feedback_string)
+# end
+{% endraw %}

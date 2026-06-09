@@ -1,0 +1,4 @@
+def script():
+  set_digital_out(1, True)
+  return True
+end

@@ -2,6 +2,8 @@ use std::error::Error;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
+// Instead of the below, broadcast the robot TF here and set the urdf as the robot_descitption parameter, i.e. our own robot state publisher
+// The ros part shouold be a feature so that we can turn off ros if we don't need it
 pub async fn robot_state_publisher(urdf: &str, namespace: &str) -> Result<JoinHandle<()>, Box<dyn Error>> {
     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
     let urdf_owned = urdf.to_string();

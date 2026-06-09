@@ -1,43 +1,131 @@
-use ur_redis_driver::driver::dashboard::{dashboard, handle_dashboard_commands_loop};
-use ur_redis_driver::driver::handle_request::script_request_server;
-use ur_redis_driver::driver::socker_server::socket_server;
+use local_ip_address::local_ip;
+use micro_sp::{ConnectionManager, StateManager, initialize_env_logger};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-use ur_redis_driver::{DriverState, realtime_reader, state_publisher};
+use ur_redis_driver::driver::dashboard::{dashboard, handle_dashboard_commands_loop};
+use ur_redis_driver::driver::socker_server::socket_server;
+use ur_redis_driver::interfaces::command_server::command_server;
+use ur_redis_driver::{
+    DriverState, URDFParameters, generate_robot_interface_state, realtime_reader, state_publisher,
+};
 
-async fn run(
-    ur_ip: &str,
-    override_host_ip: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let ur_dashboard_address = format!("{}:29999", ur_ip);
-    let ur_address = format!("{}:30003", ur_ip);
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    initialize_env_logger();
+    let robot_id = match std::env::var("ROBOT_ID") {
+        Ok(id) => id,
+        Err(e) => {
+            log::warn!(target: &&format!("r1_ur_redis_driver"), "Failed to read ROBOT_ID environment variable: {}", e);
+            log::warn!(target: &&format!("r1_ur_redis_driver"), "Setting ROBOT_ID to r1.");
+            "r1".to_string()
+        }
+    };
+    let log_target = format!("{}_ur_redis_driver", robot_id);
+    let robot_model = match std::env::var("ROBOT_MODEL") {
+        Ok(id) => id,
+        Err(e) => {
+            log::warn!(target: &log_target, "Failed to read ROBOT_MODEL environment variable: {}", e);
+            log::warn!(target: &log_target, "Setting ROBOT_MODEL to ur20.");
+            "ur20".to_string()
+        }
+    };
+    let urdf_dir = match std::env::var("URDF_DIR") {
+        Ok(id) => id,
+        Err(e) => {
+            log::warn!(target: &log_target, "Failed to read URDF_DIR environment variable: {}", e);
+            log::warn!(target: &log_target, "Setting URDF_DIR to local dir.");
+            "src/urdf/".to_string()
+        }
+    };
+    let templates_dir = "templates/".to_string();
+    let override_host_address = local_ip().ok().map(|ip| ip.to_string());
+    match &override_host_address {
+        Some(host_address) => log::info!(target: &log_target, "Setting OVERRIDE HOST ADDRESS to: {}", host_address),
+        None => log::warn!(target: &log_target, "OVERRIDE HOST ADDRESS not set."),
+    }
+
+    let ur_address = match std::env::var("UR_ADDRESS") {
+        Ok(id) => id,
+        Err(e) => {
+            log::warn!(target: &log_target, "Failed to read UR_ADDRESS environment variable: {}", e);
+            log::warn!(target: &log_target, "Setting UR_ADDRESS to 0.0.0.0");
+            "0.0.0.0".to_string()
+        }
+    };
+    let ur_dashboard_address = format!("{}:29999", ur_address);
+    let ur_address = format!("{}:30003", ur_address);
+
+    let mut path = PathBuf::from(&urdf_dir);
+    path.push(format!("{}.urdf", robot_model));
+    let urdf_path = path.to_string_lossy().to_string();
+
+    let mut params = URDFParameters::default();
+    params.name = robot_id.clone();
+    params.ur_type = robot_model;
+    params.description_file = urdf_path.clone();
+
+    let templates: tera::Tera = {
+        let tera = match tera::Tera::new(&format!("{}/*.script", templates_dir)) {
+            Ok(t) => {
+                log::warn!(target: &log_target, "Looking for Tera templates...",);
+                t
+            }
+            Err(e) => {
+                log::error!(target: &log_target, "UR Script template parsing error(s): {}", e);
+                ::std::process::exit(1);
+            }
+        };
+        tera
+    };
+
+    let template_names = templates
+        .get_template_names()
+        .map(|x| x.to_string())
+        .collect::<Vec<String>>();
+    if template_names.len() == 0 {
+        log::error!(target: &log_target, "Couldn't find any Tera templates.");
+    } else {
+        log::info!(target: &log_target, "Found templates.");
+    }
+
+    let state = generate_robot_interface_state(&robot_id, &log_target);
+    // Skip the gripper for now, but it can be added to be used with URCaps
+    // let gripper_state = generate_gripper_interface_state("g1", &log_target);
+    // let state = state.extend(gripper_state, true);
+
+    let connection_manager = ConnectionManager::new().await;
+    StateManager::set_state(&mut connection_manager.get_connection().await, &state).await;
+    let con_arc = Arc::new(connection_manager);
 
     let (tx_dashboard, rx_dashboard) = mpsc::channel(10);
     let shared_state = Arc::new(Mutex::new(DriverState::new()));
     let (local_addr_sender, local_addr_receiver) = watch::channel(None);
 
     let dashboard_task = handle_dashboard_commands_loop(tx_dashboard.clone());
-    let action_task = script_request_server(
-        ur_address.clone(),
-        local_addr_receiver.clone(),
+    let command_server = command_server(
+        &ur_address,
+        &robot_id,
+        &con_arc,
         shared_state.clone(),
+        &local_addr_receiver,
         tx_dashboard.clone(),
+        &templates,
     );
 
     let realtime_task = realtime_reader(
         shared_state.clone(),
-        ur_address,
-        override_host_ip,
+        ur_address.to_string(),
+        override_host_address,
         local_addr_sender,
     );
 
     let state_publisher_task = state_publisher(shared_state.clone());
-    let socket_server_task = socket_server(shared_state.clone(), local_addr_receiver);
+    let socket_server_task = socket_server(shared_state.clone(), local_addr_receiver.clone());
     let dashboard_connection = dashboard(rx_dashboard, ur_dashboard_address);
 
     let ret = tokio::try_join!(
-        action_task,
+        command_server,
         realtime_task,
         socket_server_task,
         dashboard_connection,
@@ -49,14 +137,16 @@ async fn run(
         shared_state.lock().unwrap().running = false;
         return Err(e.into());
     }
+
+    std::fs::File::create("/tmp/robot_controller_ready.flag").unwrap();
+
     Ok(())
 }
 
 #[tokio::main]
 async fn main() {
-    let robot_ip = "0.0.0.0"; // Define or parameterize this
     loop {
-        if let Err(e) = run(robot_ip, None).await {
+        if let Err(e) = run().await {
             println!("fatal error: {}", e);
             tokio::time::sleep(Duration::from_secs(2)).await;
         }

@@ -1,0 +1,55 @@
+global move_done = False
+global force_detected = False
+
+def script():
+  # set_tcp({{ tcp_in_faceplate }})
+  #   set_target_payload(0.710,[0.006,-0.023,0.062],[0.0,0.0,0.0,0.0,0.0,0.0])
+  #{%- if use_payload %}
+  #set_payload({{ payload }})
+  #{%- endif %}
+
+  # Phase 1: Moving down to place the part
+  # Reset flags for the downward motion
+  move_done = False
+  force_detected = False
+  
+  thread move_down_thread():
+    # Move down until contact is made
+    movel(pose_trans(get_forward_kin(), p[0.0, 0.0, 0.2, 0.0, 0.0, 0.0]), a=0.1, v=0.05)
+    # Signal that the move completed (if no force was detected)
+    move_done = True
+  end
+
+  thread force_monitor_down_thread():
+    while not move_done:
+      forces = get_tcp_force()
+      if forces[2] < -{{ force_threshold }} or forces[2] > {{ force_threshold }}:
+        set_standard_digital_out(0, False) # Stop vacuum to release part
+        force_detected = True
+        break
+      end
+      sleep(0.002)
+    end
+  end
+
+  # Run threads concurrently
+  t_move_down = run move_down_thread()
+  t_force_down = run force_monitor_down_thread()
+
+  # Wait until the part is placed (force detected) or the move finishes
+  while not move_done and not force_detected:
+    sleep(0.002)
+  end
+  
+  # Stop all motion cleanly
+  kill t_move_down
+  kill t_force_down
+  stopj(5.0)
+  sleep(0.5)
+
+  # Phase 2: Retracting after place
+  # Retract 10cm up after placing, without force monitoring.
+  movel(pose_trans(get_forward_kin(), p[0.0, 0.0, -0.1, 0.0, 0.0, 0.0]), a={{ accelleration }}, v={{ velocity }})
+  
+  return True
+end

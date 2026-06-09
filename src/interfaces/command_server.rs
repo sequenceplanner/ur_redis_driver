@@ -1,4 +1,5 @@
 use std::{
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -8,10 +9,14 @@ use std::{
 
 use futures::StreamExt;
 use micro_sp::*;
-use tokio::time::interval;
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    time::interval,
+};
+use tokio_util::task::LocalPoolHandle;
 
 // use crate::core::structs::{transform_to_string, CommandType, Payload};
-use crate::*;
+use crate::{driver::handle_request::handle_request, *};
 
 pub const UR_ACTION_SERVER_TICKER_RATE: u64 = 250;
 pub static SAFE_HOME_JOINT_STATE: [f64; 6] = [0.0, -1.5707, 0.0, -1.5707, 0.0, 0.0];
@@ -21,13 +26,17 @@ pub static DEFAULT_FACEPLATE_ID: &'static str = "tool0";
 pub static DEFAULT_ROOT_FRAME_ID: &'static str = "world";
 
 pub async fn command_server(
-    _ur_address: &str,
+    ur_address: &str,
     robot_name: &str,
     connection_manager: &Arc<ConnectionManager>,
+    driver_state: Arc<Mutex<DriverState>>,
+    local_addr: &watch::Receiver<Option<SocketAddr>>,
+    dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
     templates: &tera::Tera,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let log_target = format!("{robot_name}_action_client");
     let mut interval = interval(Duration::from_millis(ROBOT_STATE_UPDATE_INTERVAL_MS.into()));
+    let local_pool = LocalPoolHandle::new(1);
 
     let suffixes = [
         "request_trigger",
@@ -236,7 +245,7 @@ pub async fn command_server(
                     relative_pose,
                 };
 
-                let _script = match generate_core_script_from_template(
+                let script = match generate_core_script_from_template(
                     robot_name,
                     robot_command,
                     templates,
@@ -249,21 +258,89 @@ pub async fn command_server(
                     }
                 };
 
+                let local_addr = local_addr.borrow().clone();
+
+                // For now just generate a uuid for each request here, but ideally from upstream
+                let uuid = nanoid::nanoid!(10, &NANOID_ALPHABET);
+                if local_addr.is_none() || !driver_state.lock().unwrap().connected {
+                    println!("Not connected to robot yet, rejecting request: {}", uuid);
+                    publish_script_result(&uuid, false);
+                    continue;
+                }
+                let local_addr_str = local_addr.unwrap().ip().to_string();
+
+                if driver_state.lock().unwrap().robot_state != 1 {
+                    println!("Robot not in normal mode, rejecting request: {}", uuid);
+                    publish_script_result(&uuid, false);
+                    continue;
+                }
+
+                if driver_state.lock().unwrap().goal_id.is_some() {
+                    println!("Already have an active goal, rejecting request: {}", uuid);
+                    publish_script_result(&uuid, false);
+                    continue;
+                }
+
+                println!("Accepting goal request with goal id: {}", uuid);
+
+                // Note: If you want cancellation, you must hook `cancel_sender` up to your custom interface.
+                let (_cancel_sender, cancel_receiver) = mpsc::channel(1);
+
+                let req = ScriptRequest { uuid, script };
+
+                let task_ur_address = ur_address.to_string().clone();
+                let task_dashboard_commands = dashboard_commands.clone();
+                let task_driver_state = driver_state.clone();
+
+                local_pool.spawn_pinned(move || async {
+                    let result = handle_request(
+                        task_ur_address,
+                        local_addr_str,
+                        task_driver_state,
+                        task_dashboard_commands,
+                        req,
+                        cancel_receiver,
+                    )
+                    .await;
+
+                    if let Err(e) = result {
+                        println!("Error while handing goal: {}", e);
+                    }
+                });
+
                 // call the urscript driver here
             }
 
-            StateManager::set_sp_value(
-                &mut con,
-                &key("request_state"),
-                &request_state.to_spvalue(),
-            )
-            .await;
-            StateManager::set_sp_value(
-                &mut con,
-                &key("request_trigger"),
-                &request_trigger.to_spvalue(),
-            )
-            .await;
+            // The response actually cones from the handle_request when it is finished
+            // We have to spawn a task for it
+            // StateManager::set_sp_value(
+            //     &mut con,
+            //     &key("request_state"),
+            //     &request_state.to_spvalue(),
+            // )
+            // .await;
+            // StateManager::set_sp_value(
+            //     &mut con,
+            //     &key("request_trigger"),
+            //     &request_trigger.to_spvalue(),
+            // )
+            // .await;
         }
     }
+}
+
+/// TODO: Implement this to handle script execution feedback (e.g., standard output/errors).
+pub fn publish_script_feedback(uuid: &str, feedback: &str) {
+    println!("Script [{}] Feedback: {}", uuid, feedback);
+}
+
+/// TODO: Implement this to handle script completion results.
+pub fn publish_script_result(uuid: &str, success: bool) {
+    println!("Script [{}] Result: {}", uuid, success);
+}
+
+/// TODO: Implement this to yield new script requests from your custom interface.
+async fn wait_for_script_request() -> Option<ScriptRequest> {
+    // Example: Read from a custom channel or API
+    std::future::pending().await
 }

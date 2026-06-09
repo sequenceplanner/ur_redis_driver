@@ -1,0 +1,6 @@
+def script():
+  force = force()
+  feedback_string = "FORCE: " + to_str(force)
+  socket_send_line(feedback_string, "ur_driver_socket")
+  return True
+end

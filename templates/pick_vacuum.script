@@ -1,0 +1,92 @@
+global move_done = False
+global force_detected = False
+
+def script():
+  set_tcp({{ tcp_in_faceplate }})
+  
+  {%- if use_payload %}
+  set_payload({{ payload }})
+  {%- endif %}
+
+  # Phase 1: Moving down
+  # Reset flags for the downward motion
+  move_done = False
+  force_detected = False
+  
+  # Get to the above pick point
+  # movel({{ target_in_base }}, a={{ accelleration }}, v={{ velocity }})
+  
+  thread move_down_thread():
+    # Move down to make contact
+    movel(pose_trans(get_forward_kin(), p[0.0, 0.0, 0.2, 0.0, 0.0, 0.0]), a=0.1, v=0.05)
+    # Signal that the move completed without force being detected
+    move_done = True
+  end
+
+  thread force_monitor_down_thread():
+    while not move_done:
+      forces = get_tcp_force()
+      if forces[2] < -{{ force_threshold }} or forces[2] > {{ force_threshold }}:
+        set_standard_digital_out(0, True) # Start vacuum
+        force_detected = True
+        break
+      end
+      sleep(0.002)
+    end
+  end
+
+  # Run threads concurrently
+  t_move_down = run move_down_thread()
+  t_force_down = run force_monitor_down_thread()
+
+  while not move_done and not force_detected:
+    sleep(0.002)
+  end
+  
+  # Stop all motion cleanly
+  kill t_move_down
+  kill t_force_down
+  stopj(5.0)
+  sleep(0.5)
+
+  # Phase 2: Retracting after pick
+  # Reset flags for the upward motion
+  move_done = False
+  force_detected = False
+
+  # Define threads for the upward retraction move
+  thread move_up_thread():
+    # Retract 10cm up after picking
+    movel(pose_trans(get_forward_kin(), p[0.0, 0.0, -0.1, 0.0, 0.0, 0.0]), a={{ accelleration }}, v={{ velocity }})
+    move_done = True
+  end
+
+  thread force_monitor_up_thread():
+    sleep(0.4) # Wait to ignore forces from initial accelleration
+    while not move_done:
+      forces = get_tcp_force()
+      # Check for excessive force, e.g., if the part is snagged
+      if forces[2] < -{{ force_threshold }} or forces[2] > {{ force_threshold }}:
+        set_tool_digital_out(1, True) # Signal that the part may have been snagged (use payload for dropped)
+        force_detected = True
+        break
+      end
+      sleep(0.002)
+    end
+  end
+
+  # Run threads concurrently
+  t_move_up = run move_up_thread()
+  t_force_up = run force_monitor_up_thread()
+
+  # Wait until either the move finishes or a snag is detected
+  while not move_done and not force_detected:
+    sleep(0.002)
+  end
+
+  # Stop the threads. If force was detected, the move is already stopped.
+  kill t_move_up
+  kill t_force_up
+  
+  return True
+end
