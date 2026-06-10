@@ -285,6 +285,7 @@ pub struct URDFParameters {
     pub description_file: String,
     pub rviz_config_file: String,
     pub tf_prefix: String,
+    pub ur_meshes_path: String
 }
 
 impl Default for URDFParameters {
@@ -298,6 +299,7 @@ impl Default for URDFParameters {
             description_file: "TODO!".to_string(),
             rviz_config_file: "TODO!".to_string(),
             tf_prefix: "".to_string(),
+            ur_meshes_path: "TODO!".to_string(),
         }
     }
 }

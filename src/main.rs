@@ -30,19 +30,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "ur20".to_string()
         }
     };
-    let urdf_dir = match std::env::var("URDF_DIR") {
+    let ur_description_dir = match std::env::var("UR_DESCRIPTION_DIR") {
         Ok(id) => id,
         Err(e) => {
-            log::warn!(target: &log_target, "Failed to read URDF_DIR environment variable: {}", e);
-            log::warn!(target: &log_target, "Setting URDF_DIR to local dir.");
-            "src/urdf/".to_string()
+            log::warn!(target: &log_target, "Failed to read UR_DESCRIPTION_DIR environment variable: {}", e);
+            log::warn!(target: &log_target, "Setting UR_DESCRIPTION_DIR to local dir.");
+            "src/ur_description/".to_string()
         }
     };
     let templates_dir = "templates/".to_string();
     let override_host_address = local_ip().ok().map(|ip| ip.to_string());
     match &override_host_address {
-        Some(host_address) => log::info!(target: &log_target, "Setting OVERRIDE HOST ADDRESS to: {}", host_address),
-        None => log::warn!(target: &log_target, "OVERRIDE HOST ADDRESS not set."),
+        Some(host_address) => log::info!(target: &log_target, "Auto setting OVERRIDE HOST ADDRESS to: {}", host_address),
+        None => log::warn!(target: &log_target, "Automatic OVERRIDE HOST ADDRESS not set."),
     }
 
     let ur_address = match std::env::var("UR_ADDRESS") {
@@ -56,14 +56,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ur_dashboard_address = format!("{}:29999", ur_address);
     let ur_address = format!("{}:30003", ur_address);
 
-    let mut path = PathBuf::from(&urdf_dir);
-    path.push(format!("{}.urdf", robot_model));
-    let urdf_path = path.to_string_lossy().to_string();
+    let mut path_urdf = PathBuf::from(&ur_description_dir);
+    let mut path_ur_meshes = PathBuf::from(&ur_description_dir);
+    path_urdf.push(format!("urdf/{}.urdf", robot_model));
+    path_ur_meshes.push(format!("meshes/"));
+    let urdf_path = path_urdf.to_string_lossy().to_string();
+    let ur_meshes_path = path_ur_meshes.to_string_lossy().to_string();
 
     let mut params = URDFParameters::default();
     params.name = robot_id.clone();
     params.ur_type = robot_model;
     params.description_file = urdf_path.clone();
+    params.ur_meshes_path = ur_meshes_path;
 
     let templates: tera::Tera = {
         let tera = match tera::Tera::new(&format!("{}/*.script", templates_dir)) {
@@ -120,7 +124,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         local_addr_sender,
     );
 
-    let state_publisher_task = state_publisher(shared_state.clone());
+    let con_arc_clone = con_arc.clone();
+    let state_publisher_task = state_publisher(shared_state.clone(), params, &con_arc_clone);
     let socket_server_task = socket_server(shared_state.clone(), local_addr_receiver.clone());
     let dashboard_connection = dashboard(rx_dashboard, ur_dashboard_address);
 
