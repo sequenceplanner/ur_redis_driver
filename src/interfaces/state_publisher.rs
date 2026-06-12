@@ -1,6 +1,12 @@
-use micro_sp::{ConnectionManager, MapOrUnknown, SPTransform, SPTransformStamped, ToSPValue, TransformsManager};
-use redis::{aio::MultiplexedConnection};
+use k::nalgebra::{self, Quaternion};
+use k::{Isometry3, Vector3};
 use micro_sp::management::transforms;
+use micro_sp::{
+    ConnectionManager, MapOrUnknown, SPRotation, SPTransform, SPTransformStamped, SPTranslation,
+    ToSPValue, TransformsManager,
+};
+use ordered_float::OrderedFloat;
+use redis::aio::MultiplexedConnection;
 
 use crate::{DriverState, URDFParameters};
 use std::sync::{Arc, Mutex};
@@ -10,13 +16,14 @@ pub async fn state_publisher(
     robot_params: URDFParameters,
     connection_manager: &Arc<ConnectionManager>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let chain: k::Chain<f64> = k::Chain::<f64>::from_urdf_file(&robot_params.description_file).unwrap();
+    let chain: k::Chain<f64> =
+        k::Chain::<f64>::from_urdf_file(&robot_params.description_file).unwrap();
 
     let mut con = connection_manager.get_connection().await;
     initialize_robot_transforms(robot_params, &mut con).await;
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let (joints, speeds, state, prog_state, forces, inputs, outputs) = {
             let ds = driver_state.lock().unwrap();
@@ -32,15 +39,16 @@ pub async fn state_publisher(
         };
 
         publish_joint_states(&joints, &speeds).await;
-        publish_robot_transforms(&chain, &joints).await;
+        // let con_clone = con.clone();
+        publish_robot_transforms(&chain, &joints, &mut con).await;
         publish_measured_state(state, prog_state, &forces, inputs, outputs).await;
     }
 }
 
 /// TODO: Implement this to publish/send joint states to your custom system.
 async fn publish_joint_states(joints: &[f64], speeds: &[f64]) {
-    println!("Joints: {:?}", joints);
-    println!("Speeds: {:?}", speeds);
+    // println!("Joints: {:?}", joints);
+    // println!("Speeds: {:?}", speeds);
 }
 
 // async fn publish_robot_transforms(chain: &k::Chain<f64>, joints: &[f64]) {
@@ -98,25 +106,32 @@ async fn publish_joint_states(joints: &[f64], speeds: &[f64]) {
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-async fn initialize_robot_transforms(robot_params: URDFParameters, con: &mut MultiplexedConnection) {
-
-    let mut transforms_to_insert = vec!();
+async fn initialize_robot_transforms(
+    robot_params: URDFParameters,
+    con: &mut MultiplexedConnection,
+) {
+    let mut transforms_to_insert = vec![];
 
     // let mut transforms_to_insert = vec!();
     let relations = vec![
-        ("base_link", "base_link_inertia", Some("base.dae")),
-        ("base_link_inertia", "shoulder_link", None),
-        ("shoulder_link", "upper_arm_link", Some("shoulder.dae")),
-        ("upper_arm_link", "forearm_link", Some("upperarm.dae")),
-        ("forearm_link", "wrist_1_link", Some("forearm.dae")),
-        ("wrist_1_link", "wrist_2_link", Some("wrist1.dae")),
-        ("wrist_2_link", "wrist_3_link", Some("wrist2.dae")),
-        ("wrist_3_link", "flange", Some("wrist3.dae")),
-        ("wrist_3_link", "ft_frame", None),
-        ("flange", "tool0", None),
+        ("base_link", "base_link_inertia", Some("base.dae"), true),
+        ("base_link_inertia", "shoulder_link", None, false),
+        (
+            "shoulder_link",
+            "upper_arm_link",
+            Some("shoulder.dae"),
+            true,
+        ),
+        ("upper_arm_link", "forearm_link", Some("upperarm.dae"), true),
+        ("forearm_link", "wrist_1_link", Some("forearm.dae"), true),
+        ("wrist_1_link", "wrist_2_link", Some("wrist1.dae"), true),
+        ("wrist_2_link", "wrist_3_link", Some("wrist2.dae"), true),
+        ("wrist_3_link", "flange", Some("wrist3.dae"), true),
+        ("wrist_3_link", "ft_frame", None, false),
+        ("flange", "tool0", None, false),
     ];
 
-    for (parent, child, mesh) in relations {
+    for (parent, child, mesh, visualize) in relations {
         let initial_transform = SPTransformStamped {
             // parent_frame_id: format!("{}_{}", robot_params.name, parent), // add this later
             // child_frame_id: format!("{}_{}", robot_params.name, child), // add this later
@@ -127,17 +142,20 @@ async fn initialize_robot_transforms(robot_params: URDFParameters, con: &mut Mul
             enable_transform: true,
             time_stamp: SystemTime::now(),
             metadata: MapOrUnknown::Map(vec![
-                ("override_meshes_dir".to_spvalue(), robot_params.ur_meshes_path.to_spvalue()),
+                (
+                    "override_meshes_dir".to_spvalue(),
+                    robot_params.ur_meshes_path.to_spvalue(),
+                ),
                 if let Some(mesh_file) = mesh {
                     ("mesh_file".to_spvalue(), mesh_file.to_spvalue())
                 } else {
                     ("mesh_file".to_spvalue(), "".to_spvalue())
                 },
-                ("mesh_scale".to_spvalue(), 1.0.to_spvalue()),
-                ("visualize_mesh".to_spvalue(), true.to_spvalue()),
+                ("mesh_scale".to_spvalue(), 0.001.to_spvalue()),
+                ("visualize_mesh".to_spvalue(), false.to_spvalue()),
                 // BElow everything has to be 0 in order for ros2 to pick up .dae colors
-                ("mesh_a".to_spvalue(), 0.0.to_spvalue()),
-                ("mesh_r".to_spvalue(), 0.0.to_spvalue()),
+                ("mesh_a".to_spvalue(), 1.0.to_spvalue()),
+                ("mesh_r".to_spvalue(), 1.0.to_spvalue()),
                 ("mesh_g".to_spvalue(), 0.0.to_spvalue()),
                 ("mesh_b".to_spvalue(), 0.0.to_spvalue()),
             ]),
@@ -146,66 +164,63 @@ async fn initialize_robot_transforms(robot_params: URDFParameters, con: &mut Mul
     }
 
     let _ = TransformsManager::insert_transforms(con, &transforms_to_insert).await;
-
 }
 
-async fn publish_robot_transforms(chain: &k::Chain<f64>, joints: &[f64]) {
-    let current_joint_states = joints.to_vec();
-    chain.set_joint_positions(&current_joint_states).unwrap();
+async fn publish_robot_transforms(
+    chain: &k::Chain<f64>,
+    joints: &[f64],
+    con: &mut MultiplexedConnection,
+) {
+    chain.set_joint_positions(joints).unwrap();
     chain.update_link_transforms();
 
-    let mut world_transforms = HashMap::new();
-    for node in chain.iter_links() {
-        let frame_name = node.name.clone();
-        let transform = node.inertial.world_transform().unwrap_or_default();
-        world_transforms.insert(frame_name, transform);
-    }
-
-    let relations = vec![
-        ("base_link", "base_link_inertia"),
-        ("base_link_inertia", "shoulder_link"),
-        ("shoulder_link", "upper_arm_link"),
-        ("upper_arm_link", "forearm_link"),
-        ("forearm_link", "wrist_1_link"),
-        ("wrist_1_link", "wrist_2_link"),
-        ("wrist_2_link", "wrist_3_link"),
-        ("wrist_3_link", "flange"),
-        ("wrist_3_link", "ft_frame"),
-        ("flange", "tool0"),
-    ];
-
-    let mut child_to_parent = HashMap::new();
-    for (parent, child) in relations {
-        child_to_parent.insert(child.to_string(), parent.to_string());
-    }
-
-    for node in chain.iter_links() {
-        let frame_name = node.name.clone();
-        let child_world = world_transforms.get(&frame_name).unwrap();
-
-        let relative_transform = if let Some(parent_name) = child_to_parent.get(&frame_name) {
-            if let Some(parent_world) = world_transforms.get(parent_name) {
-                parent_world.inverse() * child_world
-            } else {
-                // maybe handle this differently
-                *child_world
-            }
-        } else {
-            *child_world
+    for node in chain.iter() {
+        let frame_name = match &*node.link() {
+            Some(link) => link.name.clone(),
+            None => node.joint().name.clone(),
         };
 
-        println!("Frame: {} (Relative to Parent)", frame_name);
-        println!(
-            "Translation [X, Y, Z]: {:?}",
-            relative_transform.translation.vector.as_slice()
-        );
-        println!(
-            "Rotation (Quat): {:?}",
-            relative_transform.rotation.coords.as_slice()
-        );
-        println!("---");
+        let child_world = node
+            .world_transform()
+            .unwrap_or_else(nalgebra::Isometry3::identity);
+
+        let relative_transform = if let Some(parent) = node.parent() {
+            let parent_world = parent
+                .world_transform()
+                .unwrap_or_else(nalgebra::Isometry3::identity);
+
+            parent_world.inverse() * child_world
+        } else {
+            child_world
+        };
+
+        let relative_transform_sp = isometry_to_sp_transform(relative_transform);
+
+        let _ = TransformsManager::move_transform(con, &frame_name, relative_transform_sp).await;
     }
-    println!("Joints: {:?}", joints);
+}
+
+fn isometry_to_sp_transform(isometry: Isometry3<f64>) -> SPTransform {
+    let translation_vector: &Vector3<f64> = &isometry.translation.vector;
+    let rotation_quaternion: &Quaternion<f64> = isometry.rotation.quaternion();
+
+    let sp_translation = SPTranslation {
+        x: OrderedFloat(translation_vector.x),
+        y: OrderedFloat(translation_vector.y),
+        z: OrderedFloat(translation_vector.z),
+    };
+
+    let sp_rotation = SPRotation {
+        w: OrderedFloat(rotation_quaternion.w),
+        x: OrderedFloat(rotation_quaternion.i),
+        y: OrderedFloat(rotation_quaternion.j),
+        z: OrderedFloat(rotation_quaternion.k),
+    };
+
+    SPTransform {
+        translation: sp_translation,
+        rotation: sp_rotation,
+    }
 }
 
 /// TODO: Implement this to publish/send robot measured states to your custom system.

@@ -59,7 +59,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut path_urdf = PathBuf::from(&ur_description_dir);
     let mut path_ur_meshes = PathBuf::from(&ur_description_dir);
     path_urdf.push(format!("urdf/{}.urdf", robot_model));
-    path_ur_meshes.push(format!("meshes/"));
+    path_ur_meshes.push(format!("meshes"));
+    path_ur_meshes.push(robot_model.clone());
+    path_ur_meshes.push(format!("visual"));
     let urdf_path = path_urdf.to_string_lossy().to_string();
     let ur_meshes_path = path_ur_meshes.to_string_lossy().to_string();
 
