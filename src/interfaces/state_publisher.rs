@@ -1,15 +1,18 @@
 use k::nalgebra::{self, Quaternion};
 use k::{Isometry3, Vector3};
-use micro_sp::management::transforms;
+// use micro_sp::management::transforms;
 use micro_sp::{
     ConnectionManager, MapOrUnknown, SPRotation, SPTransform, SPTransformStamped, SPTranslation,
     ToSPValue, TransformsManager,
 };
 use ordered_float::OrderedFloat;
 use redis::aio::MultiplexedConnection;
-
+// use std::collections::HashMap;
+use std::time::SystemTime;
 use crate::{DriverState, URDFParameters};
 use std::sync::{Arc, Mutex};
+use roxmltree::Document;
+use std::fs;
 
 pub async fn state_publisher(
     driver_state: Arc<Mutex<DriverState>>,
@@ -20,7 +23,8 @@ pub async fn state_publisher(
         k::Chain::<f64>::from_urdf_file(&robot_params.description_file).unwrap();
 
     let mut con = connection_manager.get_connection().await;
-    initialize_robot_transforms(robot_params, &mut con).await;
+    initialize_robot_transforms(&robot_params, &mut con).await;
+    initialize_visual_transforms(&robot_params, &mut con).await;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -51,63 +55,110 @@ async fn publish_joint_states(joints: &[f64], speeds: &[f64]) {
     // println!("Speeds: {:?}", speeds);
 }
 
-// async fn publish_robot_transforms(chain: &k::Chain<f64>, joints: &[f64]) {
-//     let current_joint_states = joints.to_vec();
-//     chain.set_joint_positions(&current_joint_states).unwrap();
-//     chain.update_link_transforms();
+fn rpy_to_quaternion(roll: f64, pitch: f64, yaw: f64) -> (f64, f64, f64, f64) {
+    let cy = (yaw * 0.5).cos();
+    let sy = (yaw * 0.5).sin();
+    let cp = (pitch * 0.5).cos();
+    let sp = (pitch * 0.5).sin();
+    let cr = (roll * 0.5).cos();
+    let sr = (roll * 0.5).sin();
 
-//     for node in chain.iter_links() {
+    let w = cr * cp * cy + sr * sp * sy;
+    let x = sr * cp * cy - cr * sp * sy;
+    let y = cr * sp * cy + sr * cp * sy;
+    let z = cr * cp * sy - sr * sp * cy;
 
-//         let frame_name = node.name.clone(); //().name.clone();
+    (x, y, z, w)
+}
 
-//         // This returns a nalgebra::Isometry3 representing the pose
-//         let transform = node.inertial.world_transform().unwrap_or_default();
-//         // let transform = node.world_transform
+pub async fn initialize_visual_transforms(
+    robot_params: &URDFParameters,
+    con: &mut MultiplexedConnection,
+) {
+    let mut transforms_to_insert = vec![];
+    let urdf_content = fs::read_to_string(&robot_params.description_file)
+        .expect("Failed to read URDF file");
+    let doc = Document::parse(&urdf_content).expect("Failed to parse URDF XML");
 
-//         println!("Frame: {}", frame_name);
-//         println!("Translation [X, Y, Z]: {:?}", transform.translation);
-//         println!("Rotation (Quat): {:?}", transform.rotation);
-//         println!("---");
-//     }
-//     println!("Joints: {:?}", joints);
-// }
+    let mesh_links = vec![
+        ("base_link_inertia", "base.dae"),
+        ("shoulder_link", "shoulder.dae"),
+        ("upper_arm_link", "upperarm.dae"),
+        ("forearm_link", "forearm.dae"),
+        ("wrist_1_link", "wrist1.dae"),
+        ("wrist_2_link", "wrist2.dae"),
+        ("wrist_3_link", "wrist3.dae"),
+    ];
 
-// async fn publish_robot_transforms(chain: &k::Chain<f64>, joints: &[f64]) {
-//     let current_joint_states = joints.to_vec();
-//     chain.set_joint_positions(&current_joint_states).unwrap();
-//     chain.update_link_transforms();
+    for (link_name, mesh_file) in mesh_links {
+        if let Some(link_node) = doc.descendants().find(|n| {
+            n.has_tag_name("link") && n.attribute("name") == Some(link_name)
+        }) {
+            let mut x = 0.0; let mut y = 0.0; let mut z = 0.0;
+            let mut roll = 0.0; let mut pitch = 0.0; let mut yaw = 0.0;
 
-//     for node in chain.iter_links() {
-//         let frame_name = node.name.clone();
+            if let Some(visual_node) = link_node.children().find(|n| n.has_tag_name("visual")) {
+                if let Some(origin_node) = visual_node.children().find(|n| n.has_tag_name("origin")) {
+                    
+                    if let Some(xyz_str) = origin_node.attribute("xyz") {
+                        let coords: Vec<f64> = xyz_str.split_whitespace()
+                                                      .filter_map(|s| s.parse().ok())
+                                                      .collect();
+                        if coords.len() == 3 {
+                            x = coords[0]; y = coords[1]; z = coords[2];
+                        }
+                    }
 
-//         // 1. Get the world transform of the current link (the child)
-//         let child_world = node.inertial.world_transform().unwrap_or_default();
+                    if let Some(rpy_str) = origin_node.attribute("rpy") {
+                        let angles: Vec<f64> = rpy_str.split_whitespace()
+                                                      .filter_map(|s| s.parse().ok())
+                                                      .collect();
+                        if angles.len() == 3 {
+                            roll = angles[0]; pitch = angles[1]; yaw = angles[2];
+                        }
+                    }
+                }
+            }
 
-//         // 2. Check if the node has a parent to calculate the relative transform
-//         let relative_transform = if let Some(parent_node) = node.parent() {
-//             // Get the world transform of the parent link
-//             let parent_world = parent_node.inertial.world_transform().unwrap_or_default();
+            let (qx, qy, qz, qw) = rpy_to_quaternion(roll, pitch, yaw);
 
-//             // Calculate child relative to parent: Parent^-1 * Child
-//             parent_world.inverse() * child_world
-//         } else {
-//             // If the node has no parent (e.g., the root/base link), its relative transform is its world transform
-//             child_world
-//         };
+            let mut sp_transform = SPTransform::default();
+            sp_transform.translation.x = OrderedFloat(x);
+            sp_transform.translation.y = OrderedFloat(y);
+            sp_transform.translation.z = OrderedFloat(z);
+            sp_transform.rotation.x = OrderedFloat(qx);
+            sp_transform.rotation.y = OrderedFloat(qy);
+            sp_transform.rotation.z = OrderedFloat(qz);
+            sp_transform.rotation.w = OrderedFloat(qw);
 
-//         println!("Frame: {} (Relative to Parent)", frame_name);
-//         println!("Translation [X, Y, Z]: {:?}", relative_transform.translation);
-//         println!("Rotation (Quat): {:?}", relative_transform.rotation);
-//         println!("---");
-//     }
-//     println!("Joints: {:?}", joints);
-// }
+            let visual_transform = SPTransformStamped {
+                parent_frame_id: link_name.to_string(),
+                child_frame_id: format!("{}_visual", link_name),
+                transform: sp_transform,
+                active_transform: false,
+                enable_transform: true,
+                time_stamp: SystemTime::now(),
+                metadata: MapOrUnknown::Map(vec![
+                    ("override_meshes_dir".to_spvalue(), robot_params.ur_meshes_path.to_spvalue()),
+                    ("mesh_file".to_spvalue(), mesh_file.to_spvalue()),
+                    ("mesh_scale".to_spvalue(), 1.0.to_spvalue()),
+                    ("visualize_mesh".to_spvalue(), true.to_spvalue()),
+                    ("mesh_a".to_spvalue(), 0.0.to_spvalue()),
+                    ("mesh_r".to_spvalue(), 0.0.to_spvalue()),
+                    ("mesh_g".to_spvalue(), 0.0.to_spvalue()),
+                    ("mesh_b".to_spvalue(), 0.0.to_spvalue()),
+                ]),
+            };
 
-use std::collections::HashMap;
-use std::time::SystemTime;
+            transforms_to_insert.push(visual_transform);
+        }
+    }
+
+    let _ = TransformsManager::insert_transforms(con, &transforms_to_insert).await;
+}
 
 async fn initialize_robot_transforms(
-    robot_params: URDFParameters,
+    robot_params: &URDFParameters,
     con: &mut MultiplexedConnection,
 ) {
     let mut transforms_to_insert = vec![];
@@ -141,24 +192,7 @@ async fn initialize_robot_transforms(
             active_transform: true,
             enable_transform: true,
             time_stamp: SystemTime::now(),
-            metadata: MapOrUnknown::Map(vec![
-                (
-                    "override_meshes_dir".to_spvalue(),
-                    robot_params.ur_meshes_path.to_spvalue(),
-                ),
-                if let Some(mesh_file) = mesh {
-                    ("mesh_file".to_spvalue(), mesh_file.to_spvalue())
-                } else {
-                    ("mesh_file".to_spvalue(), "".to_spvalue())
-                },
-                ("mesh_scale".to_spvalue(), 0.001.to_spvalue()),
-                ("visualize_mesh".to_spvalue(), false.to_spvalue()),
-                // BElow everything has to be 0 in order for ros2 to pick up .dae colors
-                ("mesh_a".to_spvalue(), 1.0.to_spvalue()),
-                ("mesh_r".to_spvalue(), 1.0.to_spvalue()),
-                ("mesh_g".to_spvalue(), 0.0.to_spvalue()),
-                ("mesh_b".to_spvalue(), 0.0.to_spvalue()),
-            ]),
+            metadata: MapOrUnknown::UNKNOWN
         };
         transforms_to_insert.push(initial_transform);
     }
@@ -179,6 +213,10 @@ async fn publish_robot_transforms(
             Some(link) => link.name.clone(),
             None => node.joint().name.clone(),
         };
+
+        if frame_name == "base_link" {
+            continue;
+        }
 
         let child_world = node
             .world_transform()
