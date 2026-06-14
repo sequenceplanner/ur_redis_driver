@@ -41,6 +41,9 @@ pub async fn command_server(
     let suffixes = [
         "request_trigger",
         "request_state",
+        "request_result",
+        "request_cancel",
+        "request_feedback",
         "command_type",
         "accelleration",
         "velocity",
@@ -90,6 +93,24 @@ pub async fn command_server(
         };
 
         let key = |suffix: &str| format!("{robot_name}_{suffix}");
+
+        let cancel_goal = state.get_bool_or_default_to_false(&key("request_cancel"), &log_target);
+
+        if cancel_goal {
+            StateManager::set_sp_value(
+                &mut con,
+                &key("request_cancel"),
+                &false.to_spvalue(),
+            ).await;
+
+            let mut ds = driver_state.lock().unwrap();
+            if let Some(sender) = ds.cancel_sender.take() {
+                println!("Cancel goal requested from Redis! Aborting active script...");
+                let _ = sender.try_send(()); 
+            } else {
+                println!("Cancel goal requested, but no active goal is running.");
+            }
+        }
 
         let mut request_trigger =
             state.get_bool_or_default_to_false(&key("request_trigger"), &log_target);
@@ -284,7 +305,12 @@ pub async fn command_server(
                 println!("Accepting goal request with goal id: {}", uuid);
 
                 // Note: If you want cancellation, you must hook `cancel_sender` up to your custom interface.
-                let (_cancel_sender, cancel_receiver) = mpsc::channel(1);
+                let (cancel_sender, cancel_receiver) = mpsc::channel(1);
+
+                {
+                    let mut ds = driver_state.lock().unwrap();
+                    ds.cancel_sender = Some(cancel_sender);
+                }
 
                 let req = ScriptRequest { uuid, script };
 
@@ -292,6 +318,7 @@ pub async fn command_server(
                 let task_dashboard_commands = dashboard_commands.clone();
                 let task_driver_state = driver_state.clone();
 
+                let con_clone = con.clone();
                 local_pool.spawn_pinned(move || async {
                     let result = handle_request(
                         task_ur_address,
@@ -300,6 +327,7 @@ pub async fn command_server(
                         task_dashboard_commands,
                         req,
                         cancel_receiver,
+                        con_clone
                     )
                     .await;
 

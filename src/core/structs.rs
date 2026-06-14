@@ -30,6 +30,7 @@ pub struct DriverState {
     pub digital_inputs: u32,
     pub digital_outputs: u32,
     pub forces: Vec<f64>,
+    pub cancel_sender: Option<mpsc::Sender<()>>,
 }
 
 impl DriverState {
@@ -48,6 +49,7 @@ impl DriverState {
             digital_inputs: 0,
             digital_outputs: 0,
             forces: vec![],
+            cancel_sender: None
         }
     }
 }

@@ -1,5 +1,7 @@
 use futures::FutureExt;
 use futures::future::{self, Either};
+use micro_sp::ActionRequestState;
+use redis::aio::MultiplexedConnection;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -17,6 +19,7 @@ pub async fn handle_request(
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
     req: ScriptRequest,
     mut cancel_receiver: mpsc::Receiver<()>, // add this back later
+    con: MultiplexedConnection
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (goal_sender, goal_receiver) = oneshot::channel::<bool>();
 
@@ -115,7 +118,69 @@ pub async fn handle_request(
             }
         };
 
-    publish_script_result(&req.uuid, result_success);
+        match result.await {
+                    Ok((status, msg)) => match status {
+                        r2r::GoalStatus::Aborted => {
+                            r2r::log_error!(
+                                &format!("{}_ur_controller", robot_name),
+                                "Goal aborted, result is {}.",
+                                msg.ok
+                            );
+                            request_state = ActionRequestState::Failed.to_string();
+                        }
+                        _ => {
+                            r2r::log_info!(
+                                &format!("{}_ur_controller", robot_name),
+                                "Goal succeeded, result is {}.",
+                                msg.ok
+                            );
+                            request_state = ActionRequestState::Succeeded.to_string();
+                        }
+                    },
+                    Err(e) => {
+                        r2r::log_error!(
+                            &format!("{}_ur_controller", robot_name),
+                            "Goal failed with {}.",
+                            e
+                        );
+                        request_state = ActionRequestState::Failed.to_string();
+                    }
+                }
+
+    // publish_script_result(&req.uuid, result_success);
+
+
+    let mut request_state = ActionRequestState::UNKNOWN;
+    match result_type {
+        ResultType::ABORTED => {
+            log::error!(
+                                &format!("{}_ur_controller", robot_name),
+                                "Goal aborted, result is {}.",
+                                msg.ok
+                            );
+            request_state = ActionRequestState::Failed.to_string();
+        },
+        ResultType::CANCELED => {
+            g.cancel(result_msg).expect("could not cancel goal");
+        }
+        ResultType::SUCCEDED => {
+            g.succeed(result_msg).expect("could not succeed goal");
+        }
+    }
+
+                // We have to spawn a task for it
+            StateManager::set_sp_value(
+                &mut con,
+                &key("request_state"),
+                &request_state.to_spvalue(),
+            )
+            .await;
+            StateManager::set_sp_value(
+                &mut con,
+                &key("request_trigger"),
+                &request_trigger.to_spvalue(),
+            )
+            .await;
 
     {
         let mut ds = driver_state.lock().unwrap();
@@ -123,6 +188,7 @@ pub async fn handle_request(
         ds.goal_sender = None;
         ds.handshake_sender = None;
         ds.feedback_sender = None;
+        ds.cancel_sender = None;
     }
 
     Ok(())

@@ -41,7 +41,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let templates_dir = "templates/".to_string();
     let override_host_address = local_ip().ok().map(|ip| ip.to_string());
     match &override_host_address {
-        Some(host_address) => log::info!(target: &log_target, "Auto setting OVERRIDE HOST ADDRESS to: {}", host_address),
+        Some(host_address) => {
+            log::info!(target: &log_target, "Auto setting OVERRIDE HOST ADDRESS to: {}", host_address)
+        }
         None => log::warn!(target: &log_target, "Automatic OVERRIDE HOST ADDRESS not set."),
     }
 
@@ -108,7 +110,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shared_state = Arc::new(Mutex::new(DriverState::new()));
     let (local_addr_sender, local_addr_receiver) = watch::channel(None);
 
-    let dashboard_task = handle_dashboard_commands_loop(tx_dashboard.clone());
+    // let dashboard_task = handle_dashboard_commands_loop(tx_dashboard.clone());
     let command_server = command_server(
         &ur_address,
         &robot_id,
@@ -131,21 +133,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let socket_server_task = socket_server(shared_state.clone(), local_addr_receiver.clone());
     let dashboard_connection = dashboard(rx_dashboard, ur_dashboard_address);
 
+    std::fs::File::create("/tmp/robot_controller_ready.flag").unwrap();
+
     let ret = tokio::try_join!(
         command_server,
         realtime_task,
         socket_server_task,
         dashboard_connection,
         state_publisher_task,
-        dashboard_task,
+        // dashboard_task,
     );
 
     if let Err(e) = ret {
         shared_state.lock().unwrap().running = false;
         return Err(e.into());
     }
-
-    std::fs::File::create("/tmp/robot_controller_ready.flag").unwrap();
 
     Ok(())
 }
