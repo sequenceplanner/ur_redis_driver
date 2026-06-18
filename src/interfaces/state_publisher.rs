@@ -29,7 +29,7 @@ pub async fn state_publisher(
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        let (joints, speeds, state, prog_state, forces, inputs, outputs) = {
+        let (mut joints, speeds, state, prog_state, forces, inputs, outputs) = {
             let ds = driver_state.lock().unwrap();
             (
                 ds.joint_values.clone(),
@@ -41,6 +41,12 @@ pub async fn state_publisher(
                 ds.digital_outputs,
             )
         };
+
+        if !joints.is_empty() {
+            joints[0] += std::f64::consts::PI; 
+            // If it rotates the *wrong* way after this, use `-=` instead, 
+            // though mathematically PI and -PI result in the same position.
+        }
 
         publish_joint_states(&joints, &speeds).await;
         // let con_clone = con.clone();

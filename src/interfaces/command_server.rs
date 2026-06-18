@@ -114,7 +114,7 @@ pub async fn command_server(
 
         let mut request_trigger =
             state.get_bool_or_default_to_false(&key("request_trigger"), &log_target);
-        let mut request_state =
+        let request_state =
             state.get_string_or_default_to_unknown(&key("request_state"), &log_target);
 
         if request_trigger {
@@ -319,9 +319,12 @@ pub async fn command_server(
                 let task_driver_state = driver_state.clone();
 
                 let con_clone = con.clone();
+                // let keys_clone = keys.clone();
+                let robot_name_clone = robot_name.to_string().clone();
                 local_pool.spawn_pinned(move || async {
                     let result = handle_request(
                         task_ur_address,
+                        robot_name_clone,
                         local_addr_str,
                         task_driver_state,
                         task_dashboard_commands,
@@ -338,21 +341,6 @@ pub async fn command_server(
 
                 // call the urscript driver here
             }
-
-            // The response actually cones from the handle_request when it is finished
-            // We have to spawn a task for it
-            // StateManager::set_sp_value(
-            //     &mut con,
-            //     &key("request_state"),
-            //     &request_state.to_spvalue(),
-            // )
-            // .await;
-            // StateManager::set_sp_value(
-            //     &mut con,
-            //     &key("request_trigger"),
-            //     &request_trigger.to_spvalue(),
-            // )
-            // .await;
         }
     }
 }

@@ -1,6 +1,6 @@
 use futures::FutureExt;
 use futures::future::{self, Either};
-use micro_sp::ActionRequestState;
+use micro_sp::{ActionRequestState, StateManager, ToSPValue};
 use redis::aio::MultiplexedConnection;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,14 +14,17 @@ use crate::{DashboardCommand, DriverState, ScriptRequest, generate_ur_script};
 
 pub async fn handle_request(
     ur_address: String,
+    robot_name: String,
     host_address: String,
     driver_state: Arc<Mutex<DriverState>>,
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
     req: ScriptRequest,
-    mut cancel_receiver: mpsc::Receiver<()>, // add this back later
-    con: MultiplexedConnection
+    mut cancel_receiver: mpsc::Receiver<()>,
+    mut con: MultiplexedConnection,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let key = |suffix: &str| format!("{robot_name}_{suffix}");
     let (goal_sender, goal_receiver) = oneshot::channel::<bool>();
+    let log_target = "ur_redis_driver";
 
     println!("making a new connection to the driver.");
     let conn = TcpStream::connect(&ur_address).await;
@@ -118,69 +121,23 @@ pub async fn handle_request(
             }
         };
 
-        match result.await {
-                    Ok((status, msg)) => match status {
-                        r2r::GoalStatus::Aborted => {
-                            r2r::log_error!(
-                                &format!("{}_ur_controller", robot_name),
-                                "Goal aborted, result is {}.",
-                                msg.ok
-                            );
-                            request_state = ActionRequestState::Failed.to_string();
-                        }
-                        _ => {
-                            r2r::log_info!(
-                                &format!("{}_ur_controller", robot_name),
-                                "Goal succeeded, result is {}.",
-                                msg.ok
-                            );
-                            request_state = ActionRequestState::Succeeded.to_string();
-                        }
-                    },
-                    Err(e) => {
-                        r2r::log_error!(
-                            &format!("{}_ur_controller", robot_name),
-                            "Goal failed with {}.",
-                            e
-                        );
-                        request_state = ActionRequestState::Failed.to_string();
-                    }
-                }
-
-    // publish_script_result(&req.uuid, result_success);
-
-
-    let mut request_state = ActionRequestState::UNKNOWN;
+    let request_state;
     match result_type {
         ResultType::ABORTED => {
-            log::error!(
-                                &format!("{}_ur_controller", robot_name),
-                                "Goal aborted, result is {}.",
-                                msg.ok
-                            );
+            log::error!(target: &log_target, "Goal aborted, result is: '{}'.", result_success);
             request_state = ActionRequestState::Failed.to_string();
-        },
+        }
         ResultType::CANCELED => {
-            g.cancel(result_msg).expect("could not cancel goal");
+            log::warn!(target: &log_target, "Goal cancelled, result is: '{}'.", result_success);
+            request_state = ActionRequestState::Succeeded.to_string();
         }
         ResultType::SUCCEDED => {
-            g.succeed(result_msg).expect("could not succeed goal");
+            log::info!(target: &log_target, "Goal succeeded, result is: '{}'.", result_success);
+            request_state = ActionRequestState::Succeeded.to_string();
         }
     }
 
-                // We have to spawn a task for it
-            StateManager::set_sp_value(
-                &mut con,
-                &key("request_state"),
-                &request_state.to_spvalue(),
-            )
-            .await;
-            StateManager::set_sp_value(
-                &mut con,
-                &key("request_trigger"),
-                &request_trigger.to_spvalue(),
-            )
-            .await;
+    StateManager::set_sp_value(&mut con, &key("request_state"), &request_state.to_spvalue()).await;
 
     {
         let mut ds = driver_state.lock().unwrap();
