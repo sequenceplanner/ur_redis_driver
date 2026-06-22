@@ -108,6 +108,56 @@ impl fmt::Display for DashboardCommandType {
     }
 }
 
+// This is to be sent out in the orbot command
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Waypoint {
+    pub accelleration: f64,
+    pub velocity: f64,
+    pub global_acceleration_scaling: f64,
+    pub global_velocity_scaling: f64,
+    pub use_execution_time: bool,
+    pub execution_time: f64,
+    pub use_blend_radius: bool,
+    pub blend_radius: f64,
+    pub use_joint_positions: bool,
+    pub joint_positions: Vec<f64>,
+    pub use_preferred_joint_config: bool,
+    pub preferred_joint_config: Vec<f64>,
+    pub use_payload: bool,
+    pub payload: String,
+    pub target_in_base: String,
+    pub relative_pose: Vec<f64>,
+    pub tcp_in_faceplate: String,
+    pub force_threshold: f64,
+}
+
+// This arrives in the "waypoints" from redis
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WaypointRaw {
+    pub accelleration: f64,
+    pub velocity: f64,
+    pub global_acceleration_scaling: f64,
+    pub global_velocity_scaling: f64,
+    pub use_execution_time: bool,
+    pub execution_time: f64,
+    pub use_blend_radius: bool,
+    pub blend_radius: f64,
+    pub use_joint_positions: bool,
+    pub joint_positions: Vec<f64>,
+    pub use_preferred_joint_config: bool,
+    pub preferred_joint_config: Vec<f64>,
+    pub use_relative_pose: bool,
+    pub relative_pose: Vec<f64>,
+    pub use_payload: bool,
+    pub payload: String,
+    pub baseframe_id: String,
+    pub faceplate_id: String,
+    pub goal_feature_id: String,
+    pub tcp_id: String,
+    pub root_frame_id: String,
+    pub force_threshold: f64,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RobotCommand {
     // MoveJ, Movel, StartVacuum...
@@ -160,6 +210,7 @@ pub struct RobotCommand {
     pub relative_pose: Vec<f64>, // use pose_to_string, relative to current TCP pose
     pub tcp_in_faceplate: String, // use pose_to_string
     pub force_threshold: f64,
+    pub waypoints: Vec<Waypoint>
     // pub gripper_velocity: f64,
     // pub gripper_force: f64,
     // pub gripper_ref_pos_percentage: i64,

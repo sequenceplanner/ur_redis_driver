@@ -4,6 +4,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
 // use std::net::TcpStream;
 // use std::io;
 
@@ -69,6 +71,7 @@ pub async fn command_server(
         "relative_pose",
         "force_feedback",
         "reset_request_mechanism",
+        "waypoints_raw",
     ];
 
     let keys: Vec<String> = suffixes
@@ -97,16 +100,12 @@ pub async fn command_server(
         let cancel_goal = state.get_bool_or_default_to_false(&key("request_cancel"), &log_target);
 
         if cancel_goal {
-            StateManager::set_sp_value(
-                &mut con,
-                &key("request_cancel"),
-                &false.to_spvalue(),
-            ).await;
+            StateManager::set_sp_value(&mut con, &key("request_cancel"), &false.to_spvalue()).await;
 
             let mut ds = driver_state.lock().unwrap();
             if let Some(sender) = ds.cancel_sender.take() {
                 println!("Cancel goal requested from Redis! Aborting active script...");
-                let _ = sender.try_send(()); 
+                let _ = sender.try_send(());
             } else {
                 println!("Cancel goal requested, but no active goal is running.");
             }
@@ -244,6 +243,97 @@ pub async fn command_server(
                         };
                 }
 
+                let waypoints_raw_str =
+                    state.get_string_or_default_to_unknown(&key("waypoints_raw"), &log_target);
+
+                let waypoints_raw: Vec<WaypointRaw> =
+                    if waypoints_raw_str != "UNKNOWN" && !waypoints_raw_str.is_empty() {
+                        match base64::engine::general_purpose::STANDARD.decode(&waypoints_raw_str) {
+                            Ok(decoded_bytes) => {
+                                let json_str = String::from_utf8_lossy(&decoded_bytes);
+                                match serde_json::from_str(&json_str) {
+                                    Ok(parsed_waypoints_raw) => parsed_waypoints_raw,
+                                    Err(e) => {
+                                        println!(
+                                            "Failed to parse waypoints JSON for {}: {}",
+                                            robot_name, e
+                                        );
+                                        vec![]
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!(
+                                    "Failed to decode Base64 waypoints for {}: {}",
+                                    robot_name, e
+                                );
+                                vec![]
+                            }
+                        }
+                    } else {
+                        vec![]
+                    };
+
+                let mut waypoints = vec![];
+                for wpr in waypoints_raw {
+                    let mut wp_target_in_base = transform_to_string(&SPTransformStamped {
+                        active_transform: true,
+                        enable_transform: true,
+                        time_stamp: SystemTime::now(),
+                        parent_frame_id: "".to_string(),
+                        child_frame_id: "".to_string(),
+                        transform: SPTransform::default(),
+                        metadata: MapOrUnknown::UNKNOWN,
+                    });
+
+                    let mut wp_tcp_in_faceplate = wp_target_in_base.clone();
+
+                    if !wpr.use_joint_positions && !wpr.use_relative_pose {
+                        wp_target_in_base = match TransformsManager::lookup_transform(
+                            &mut con,
+                            &wpr.baseframe_id,
+                            &wpr.goal_feature_id,
+                        )
+                        .await
+                        {
+                            Ok(transform) => transform_to_string(&transform),
+                            Err(_) => continue,
+                        };
+
+                        wp_tcp_in_faceplate = match TransformsManager::lookup_transform(
+                            &mut con,
+                            &wpr.faceplate_id,
+                            &wpr.tcp_id,
+                        )
+                        .await
+                        {
+                            Ok(transform) => transform_to_string(&transform),
+                            Err(_) => continue,
+                        };
+                    }
+
+                    waypoints.push(Waypoint {
+                        accelleration: wpr.accelleration,
+                        velocity: wpr.velocity,
+                        global_acceleration_scaling: wpr.global_acceleration_scaling,
+                        global_velocity_scaling: wpr.global_velocity_scaling,
+                        use_execution_time: wpr.use_execution_time,
+                        execution_time: wpr.execution_time,
+                        use_blend_radius: wpr.use_blend_radius,
+                        blend_radius: wpr.blend_radius,
+                        use_joint_positions: wpr.use_joint_positions,
+                        joint_positions: wpr.joint_positions,
+                        use_preferred_joint_config: wpr.use_preferred_joint_config,
+                        preferred_joint_config: wpr.preferred_joint_config,
+                        use_payload: wpr.use_payload,
+                        payload: wpr.payload,
+                        target_in_base: wp_target_in_base,
+                        relative_pose: wpr.relative_pose,
+                        tcp_in_faceplate: wp_tcp_in_faceplate,
+                        force_threshold: wpr.force_threshold,
+                    });
+                }
+
                 let robot_command = RobotCommand {
                     command_type,
                     accelleration,
@@ -264,7 +354,14 @@ pub async fn command_server(
                     tcp_in_faceplate,
                     force_threshold,
                     relative_pose,
+                    waypoints,
                 };
+
+                println!(
+                    "Sending {} waypoints to Tera for template {}",
+                    robot_command.waypoints.len(),
+                    robot_command.command_type
+                );
 
                 let script = match generate_core_script_from_template(
                     robot_name,
@@ -330,7 +427,7 @@ pub async fn command_server(
                         task_dashboard_commands,
                         req,
                         cancel_receiver,
-                        con_clone
+                        con_clone,
                     )
                     .await;
 
