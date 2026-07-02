@@ -8,11 +8,11 @@ use micro_sp::{
 use ordered_float::OrderedFloat;
 use redis::aio::MultiplexedConnection;
 // use std::collections::HashMap;
-use std::time::SystemTime;
 use crate::{DriverState, URDFParameters};
-use std::sync::{Arc, Mutex};
 use roxmltree::Document;
 use std::fs;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 pub async fn state_publisher(
     driver_state: Arc<Mutex<DriverState>>,
@@ -27,7 +27,7 @@ pub async fn state_publisher(
     initialize_visual_transforms(&robot_params, &mut con).await;
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         let (mut joints, speeds, state, prog_state, forces, inputs, outputs) = {
             let ds = driver_state.lock().unwrap();
@@ -43,8 +43,8 @@ pub async fn state_publisher(
         };
 
         if !joints.is_empty() {
-            joints[0] += std::f64::consts::PI; 
-            // If it rotates the *wrong* way after this, use `-=` instead, 
+            joints[0] += std::f64::consts::PI;
+            // If it rotates the *wrong* way after this, use `-=` instead,
             // though mathematically PI and -PI result in the same position.
         }
 
@@ -82,8 +82,8 @@ pub async fn initialize_visual_transforms(
     con: &mut MultiplexedConnection,
 ) {
     let mut transforms_to_insert = vec![];
-    let urdf_content = fs::read_to_string(&robot_params.description_file)
-        .expect("Failed to read URDF file");
+    let urdf_content =
+        fs::read_to_string(&robot_params.description_file).expect("Failed to read URDF file");
     let doc = Document::parse(&urdf_content).expect("Failed to parse URDF XML");
 
     let mesh_links = vec![
@@ -97,30 +97,41 @@ pub async fn initialize_visual_transforms(
     ];
 
     for (link_name, mesh_file) in mesh_links {
-        if let Some(link_node) = doc.descendants().find(|n| {
-            n.has_tag_name("link") && n.attribute("name") == Some(link_name)
-        }) {
-            let mut x = 0.0; let mut y = 0.0; let mut z = 0.0;
-            let mut roll = 0.0; let mut pitch = 0.0; let mut yaw = 0.0;
+        if let Some(link_node) = doc
+            .descendants()
+            .find(|n| n.has_tag_name("link") && n.attribute("name") == Some(link_name))
+        {
+            let mut x = 0.0;
+            let mut y = 0.0;
+            let mut z = 0.0;
+            let mut roll = 0.0;
+            let mut pitch = 0.0;
+            let mut yaw = 0.0;
 
             if let Some(visual_node) = link_node.children().find(|n| n.has_tag_name("visual")) {
-                if let Some(origin_node) = visual_node.children().find(|n| n.has_tag_name("origin")) {
-                    
+                if let Some(origin_node) = visual_node.children().find(|n| n.has_tag_name("origin"))
+                {
                     if let Some(xyz_str) = origin_node.attribute("xyz") {
-                        let coords: Vec<f64> = xyz_str.split_whitespace()
-                                                      .filter_map(|s| s.parse().ok())
-                                                      .collect();
+                        let coords: Vec<f64> = xyz_str
+                            .split_whitespace()
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
                         if coords.len() == 3 {
-                            x = coords[0]; y = coords[1]; z = coords[2];
+                            x = coords[0];
+                            y = coords[1];
+                            z = coords[2];
                         }
                     }
 
                     if let Some(rpy_str) = origin_node.attribute("rpy") {
-                        let angles: Vec<f64> = rpy_str.split_whitespace()
-                                                      .filter_map(|s| s.parse().ok())
-                                                      .collect();
+                        let angles: Vec<f64> = rpy_str
+                            .split_whitespace()
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
                         if angles.len() == 3 {
-                            roll = angles[0]; pitch = angles[1]; yaw = angles[2];
+                            roll = angles[0];
+                            pitch = angles[1];
+                            yaw = angles[2];
                         }
                     }
                 }
@@ -145,7 +156,10 @@ pub async fn initialize_visual_transforms(
                 enable_transform: true,
                 time_stamp: SystemTime::now(),
                 metadata: MapOrUnknown::Map(vec![
-                    ("override_meshes_dir".to_spvalue(), robot_params.ur_meshes_path.to_spvalue()),
+                    (
+                        "override_meshes_dir".to_spvalue(),
+                        robot_params.ur_meshes_path.to_spvalue(),
+                    ),
                     ("mesh_file".to_spvalue(), mesh_file.to_spvalue()),
                     ("mesh_scale".to_spvalue(), 1.0.to_spvalue()),
                     ("visualize_mesh".to_spvalue(), true.to_spvalue()),
@@ -198,7 +212,7 @@ async fn initialize_robot_transforms(
             active_transform: true,
             enable_transform: true,
             time_stamp: SystemTime::now(),
-            metadata: MapOrUnknown::UNKNOWN
+            metadata: MapOrUnknown::UNKNOWN,
         };
         transforms_to_insert.push(initial_transform);
     }
@@ -211,37 +225,39 @@ async fn publish_robot_transforms(
     joints: &[f64],
     con: &mut MultiplexedConnection,
 ) {
-    chain.set_joint_positions(joints).unwrap();
-    chain.update_link_transforms();
+    if let Ok(()) = chain.set_joint_positions(joints) {
+        chain.update_link_transforms();
 
-    for node in chain.iter() {
-        let frame_name = match &*node.link() {
-            Some(link) => link.name.clone(),
-            None => node.joint().name.clone(),
-        };
+        for node in chain.iter() {
+            let frame_name = match &*node.link() {
+                Some(link) => link.name.clone(),
+                None => node.joint().name.clone(),
+            };
 
-        if frame_name == "base_link" {
-            continue;
-        }
+            if frame_name == "base_link" {
+                continue;
+            }
 
-        let child_world = node
-            .world_transform()
-            .unwrap_or_else(nalgebra::Isometry3::identity);
-
-        let relative_transform = if let Some(parent) = node.parent() {
-            let parent_world = parent
+            let child_world = node
                 .world_transform()
                 .unwrap_or_else(nalgebra::Isometry3::identity);
 
-            parent_world.inverse() * child_world
-        } else {
-            child_world
-        };
+            let relative_transform = if let Some(parent) = node.parent() {
+                let parent_world = parent
+                    .world_transform()
+                    .unwrap_or_else(nalgebra::Isometry3::identity);
 
-        let relative_transform_sp = isometry_to_sp_transform(relative_transform);
+                parent_world.inverse() * child_world
+            } else {
+                child_world
+            };
 
-        let _ = TransformsManager::move_transform(con, &frame_name, relative_transform_sp).await;
-    }
+            let relative_transform_sp = isometry_to_sp_transform(relative_transform);
+
+            let _ =
+                TransformsManager::move_transform(con, &frame_name, relative_transform_sp).await;
+        }
+    };
 }
 
 fn isometry_to_sp_transform(isometry: Isometry3<f64>) -> SPTransform {

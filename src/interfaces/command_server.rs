@@ -12,6 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use micro_sp::*;
 use tokio::{
+    net::tcp,
     sync::{mpsc, oneshot, watch},
     time::interval,
 };
@@ -71,7 +72,7 @@ pub async fn command_server(
         "relative_pose",
         "force_feedback",
         "reset_request_mechanism",
-        "waypoints_raw",
+        "waypoints",
     ];
 
     let keys: Vec<String> = suffixes
@@ -219,6 +220,7 @@ pub async fn command_server(
                 let mut tcp_in_faceplate = target_in_base.clone();
 
                 if !use_joint_positions
+                    && command_type != "trajectory_unsafe_move_j"
                     && !use_relative_pose
                     && command_type != "lock_rsp"
                     && command_type != "unlock_rsp"
@@ -244,28 +246,19 @@ pub async fn command_server(
                 }
 
                 let waypoints_raw_str =
-                    state.get_string_or_default_to_unknown(&key("waypoints_raw"), &log_target);
+                    state.get_string_or_default_to_unknown(&key("waypoints"), &log_target);
 
                 let waypoints_raw: Vec<WaypointRaw> =
                     if waypoints_raw_str != "UNKNOWN" && !waypoints_raw_str.is_empty() {
-                        match base64::engine::general_purpose::STANDARD.decode(&waypoints_raw_str) {
-                            Ok(decoded_bytes) => {
-                                let json_str = String::from_utf8_lossy(&decoded_bytes);
-                                match serde_json::from_str(&json_str) {
-                                    Ok(parsed_waypoints_raw) => parsed_waypoints_raw,
-                                    Err(e) => {
-                                        println!(
-                                            "Failed to parse waypoints JSON for {}: {}",
-                                            robot_name, e
-                                        );
-                                        vec![]
-                                    }
-                                }
-                            }
+                        // Swap the single quotes back to double quotes so serde_json can parse it
+                        let valid_json_str = waypoints_raw_str.replace("'", "\"");
+
+                        match serde_json::from_str(&valid_json_str) {
+                            Ok(parsed_waypoints) => parsed_waypoints,
                             Err(e) => {
-                                println!(
-                                    "Failed to decode Base64 waypoints for {}: {}",
-                                    robot_name, e
+                                log::error!(
+                                    target: &log_target,
+                                    "Failed to parse waypoints JSON for {}: {}", robot_name, e
                                 );
                                 vec![]
                             }
@@ -273,6 +266,34 @@ pub async fn command_server(
                     } else {
                         vec![]
                     };
+
+                // let waypoints_raw: Vec<WaypointRaw> =
+                //     if waypoints_raw_str != "UNKNOWN" && !waypoints_raw_str.is_empty() {
+                //         match base64::engine::general_purpose::STANDARD.decode(&waypoints_raw_str) {
+                //             Ok(decoded_bytes) => {
+                //                 let json_str = String::from_utf8_lossy(&decoded_bytes);
+                //                 match serde_json::from_str(&json_str) {
+                //                     Ok(parsed_waypoints_raw) => parsed_waypoints_raw,
+                //                     Err(e) => {
+                //                         println!(
+                //                             "Failed to parse waypoints JSON for {}: {}",
+                //                             robot_name, e
+                //                         );
+                //                         vec![]
+                //                     }
+                //                 }
+                //             }
+                //             Err(e) => {
+                //                 println!(
+                //                     "Failed to decode Base64 waypoints for {}: {}",
+                //                     robot_name, e
+                //                 );
+                //                 vec![]
+                //             }
+                //         }
+                //     } else {
+                //         vec![]
+                //     };
 
                 let mut waypoints = vec![];
                 for wpr in waypoints_raw {
@@ -286,12 +307,10 @@ pub async fn command_server(
                         metadata: MapOrUnknown::UNKNOWN,
                     });
 
-                    let mut wp_tcp_in_faceplate = wp_target_in_base.clone();
-
                     if !wpr.use_joint_positions && !wpr.use_relative_pose {
                         wp_target_in_base = match TransformsManager::lookup_transform(
                             &mut con,
-                            &wpr.baseframe_id,
+                            &baseframe_id,
                             &wpr.goal_feature_id,
                         )
                         .await
@@ -300,10 +319,10 @@ pub async fn command_server(
                             Err(_) => continue,
                         };
 
-                        wp_tcp_in_faceplate = match TransformsManager::lookup_transform(
+                        tcp_in_faceplate = match TransformsManager::lookup_transform(
                             &mut con,
-                            &wpr.faceplate_id,
-                            &wpr.tcp_id,
+                            &faceplate_id,
+                            &tcp_id,
                         )
                         .await
                         {
@@ -329,7 +348,7 @@ pub async fn command_server(
                         payload: wpr.payload,
                         target_in_base: wp_target_in_base,
                         relative_pose: wpr.relative_pose,
-                        tcp_in_faceplate: wp_tcp_in_faceplate,
+                        tcp_in_faceplate: tcp_in_faceplate.clone(), // we dont want to change tcps in a blended move
                         force_threshold: wpr.force_threshold,
                     });
                 }
@@ -356,12 +375,6 @@ pub async fn command_server(
                     relative_pose,
                     waypoints,
                 };
-
-                println!(
-                    "Sending {} waypoints to Tera for template {}",
-                    robot_command.waypoints.len(),
-                    robot_command.command_type
-                );
 
                 let script = match generate_core_script_from_template(
                     robot_name,

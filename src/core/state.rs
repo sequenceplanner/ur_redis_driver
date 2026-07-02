@@ -54,7 +54,7 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let gripper_force = fv!(&&format!("{}_gripper_force", robot_name));
     let gripper_velocity = fv!(&&format!("{}_gripper_velocity", robot_name));
     let gripper_ref_pos_percentage = iv!(&&format!("{}_gripper_ref_pos_percentage", robot_name));
-    let waypoints_raw = av!(&&format!("{}_waypoints_raw", robot_name));
+    let waypoints = av!(&&format!("{}_waypoints", robot_name));
 
     let state = state.add(assign!(command_type, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(accelleration, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
@@ -86,7 +86,7 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let state = state.add(assign!(gripper_force, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(gripper_velocity, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(gripper_ref_pos_percentage, SPValue::Int64(IntOrUnknown::UNKNOWN)), &log_target);
-    let state = state.add(assign!(waypoints_raw, SPValue::Array(ArrayOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(waypoints, SPValue::Array(ArrayOrUnknown::UNKNOWN)), &log_target);
 
     state
 }
