@@ -25,7 +25,7 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let state = state.add(assign!(subsequent_fail_counter, 0.to_spvalue()), &log_target);
 
     let command_type = v!(&&format!("{}_command_type", robot_name));
-    let accelleration = fv!(&&format!("{}_accelleration", robot_name));
+    let acceleration = fv!(&&format!("{}_acceleration", robot_name));
     let velocity = fv!(&&format!("{}_velocity", robot_name));
     let global_acceleration_scaling = fv!(&&format!("{}_global_acceleration_scaling", robot_name));
     let global_velocity_scaling = fv!(&&format!("{}_global_velocity_scaling", robot_name));
@@ -57,7 +57,7 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let waypoints = av!(&&format!("{}_waypoints", robot_name));
 
     let state = state.add(assign!(command_type, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
-    let state = state.add(assign!(accelleration, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(acceleration, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(velocity, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(global_acceleration_scaling, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(global_velocity_scaling, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);

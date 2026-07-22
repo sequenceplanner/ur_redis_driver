@@ -14,7 +14,7 @@ def script():
     set_target_payload({{ payload }})
     {%- endif %}
     set_tcp({{ tcp_in_faceplate }})
-    movel({{ target_in_base }}, a={{ accelleration }}, v={{ velocity }}
+    movel({{ target_in_base }}, a={{ acceleration }}, v={{ velocity }}
     {%- if use_execution_time -%}
     , t={{ execution_time }}
     {%- endif -%}

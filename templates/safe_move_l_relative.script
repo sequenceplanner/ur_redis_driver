@@ -11,7 +11,7 @@ def script():
 
   thread move_thread():
     set_tcp({{ tcp_in_faceplate }})
-    movel(pose_trans(get_forward_kin(), p{{ relative_pose }}), a={{ accelleration }}, v={{ velocity }}
+    movel(pose_trans(get_forward_kin(), p{{ relative_pose }}), a={{ acceleration }}, v={{ velocity }}
     {%- if use_execution_time -%}
     , t={{ execution_time }}
     {%- endif -%}

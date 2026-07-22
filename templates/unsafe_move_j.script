@@ -5,7 +5,7 @@ def script():
   set_tcp({{ tcp_in_faceplate }})
   {% if use_joint_positions -%}
   socket_send_line("movej without inverse kinematics starting.", "ur_driver_socket")
-  movej({{ joint_positions }}, a={{ accelleration }}, v={{ velocity }}
+  movej({{ joint_positions }}, a={{ acceleration }}, v={{ velocity }}
   {%- if use_execution_time -%}
   , t={{ execution_time }}
   {%- endif -%}
@@ -23,7 +23,7 @@ def script():
       {%- if use_preferred_joint_config -%}
       , qnear={{ preferred_joint_config }}
       {%- endif -%})
-    , a={{ accelleration }}, v={{ velocity }}
+    , a={{ acceleration }}, v={{ velocity }}
     {%- if use_execution_time -%}
     , t={{ execution_time }}
     {%- endif -%}

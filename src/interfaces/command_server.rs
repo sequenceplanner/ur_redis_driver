@@ -48,7 +48,7 @@ pub async fn command_server(
         "request_cancel",
         "request_feedback",
         "command_type",
-        "accelleration",
+        "acceleration",
         "velocity",
         "global_acceleration_scaling",
         "global_velocity_scaling",
@@ -129,8 +129,8 @@ pub async fn command_server(
             if request_state == ActionRequestState::Initial.to_string() {
                 let command_type =
                     state.get_string_or_default_to_unknown(&key("command_type"), &log_target);
-                let accelleration =
-                    state.get_float_or_default_to_zero(&key("accelleration"), &log_target);
+                let acceleration =
+                    state.get_float_or_default_to_zero(&key("acceleration"), &log_target);
                 let velocity = state.get_float_or_default_to_zero(&key("velocity"), &log_target);
                 let global_acceleration_scaling = state
                     .get_float_or_default_to_zero(&key("global_acceleration_scaling"), &log_target);
@@ -245,48 +245,20 @@ pub async fn command_server(
                         };
                 }
 
-                let waypoints_raw_str =
-                    state.get_string_or_default_to_unknown(&key("waypoints"), &log_target);
-
-                let waypoints_raw: Vec<WaypointRaw> =
-                    if waypoints_raw_str != "UNKNOWN" && !waypoints_raw_str.is_empty() {
-                        // Swap the single quotes back to double quotes so serde_json can parse it
-                        let valid_json_str = waypoints_raw_str.replace("'", "\"");
-
-                        match serde_json::from_str(&valid_json_str) {
-                            Ok(parsed_waypoints) => parsed_waypoints,
-                            Err(e) => {
-                                log::error!(
-                                    target: &log_target,
-                                    "Failed to parse waypoints JSON for {}: {}", robot_name, e
-                                );
-                                vec![]
-                            }
-                        }
-                    } else {
-                        vec![]
-                    };
+                // working
+                // let waypoints_raw_str =
+                //     state.get_string_or_default_to_unknown(&key("waypoints"), &log_target);
 
                 // let waypoints_raw: Vec<WaypointRaw> =
                 //     if waypoints_raw_str != "UNKNOWN" && !waypoints_raw_str.is_empty() {
-                //         match base64::engine::general_purpose::STANDARD.decode(&waypoints_raw_str) {
-                //             Ok(decoded_bytes) => {
-                //                 let json_str = String::from_utf8_lossy(&decoded_bytes);
-                //                 match serde_json::from_str(&json_str) {
-                //                     Ok(parsed_waypoints_raw) => parsed_waypoints_raw,
-                //                     Err(e) => {
-                //                         println!(
-                //                             "Failed to parse waypoints JSON for {}: {}",
-                //                             robot_name, e
-                //                         );
-                //                         vec![]
-                //                     }
-                //                 }
-                //             }
+                //         let valid_json_str = waypoints_raw_str.replace("'", "\"");
+
+                //         match serde_json::from_str(&valid_json_str) {
+                //             Ok(parsed_waypoints) => parsed_waypoints,
                 //             Err(e) => {
-                //                 println!(
-                //                     "Failed to decode Base64 waypoints for {}: {}",
-                //                     robot_name, e
+                //                 log::error!(
+                //                     target: &log_target,
+                //                     "Failed to parse waypoints JSON for {}: {}", robot_name, e
                 //                 );
                 //                 vec![]
                 //             }
@@ -294,6 +266,393 @@ pub async fn command_server(
                 //     } else {
                 //         vec![]
                 //     };
+
+                //experimental but working!
+                // 1. Get the pre-evaluated array from state
+                // let waypoints_sp = state.get_value(&key("waypoints"), &log_target);
+                // let mut waypoints_raw: Vec<WaypointRaw> = vec![];
+
+                // if let Some(micro_sp::SPValue::Array(ArrayOrUnknown::Array(arr))) = waypoints_sp {
+                //     let mut extract_all = || -> Option<Vec<WaypointRaw>> {
+                //         let mut extracted = Vec::with_capacity(arr.len());
+
+                //         for item in arr.iter() {
+                //             if let micro_sp::SPValue::Map(MapOrUnknown::Map(map)) = item {
+                //                 // Helper to pull values out of the Map
+                //                 let get_val = |k: &str| -> Option<&SPValue> {
+                //                     map.iter()
+                //                         .find(|(key_sp, _)| {
+                //                             if let SPValue::String(StringOrUnknown::String(s)) = key_sp {
+                //                                 s == k
+                //                             } else {
+                //                                 false
+                //                             }
+                //                         })
+                //                         .map(|(_, val_sp)| val_sp)
+                //                 };
+
+                //                 let get_f64 = |k: &str| -> Option<f64> {
+                //                     match get_val(k)? {
+                //                         SPValue::Float64(FloatOrUnknown::Float64(f)) => Some(f.into_inner()),
+                //                         SPValue::Int64(IntOrUnknown::Int64(i)) => Some(*i as f64),
+                //                         _ => None,
+                //                     }
+                //                 };
+
+                //                 let get_bool = |k: &str| -> Option<bool> {
+                //                     match get_val(k)? {
+                //                         SPValue::Bool(BoolOrUnknown::Bool(b)) => Some(*b),
+                //                         _ => None,
+                //                     }
+                //                 };
+
+                //                 let get_string = |k: &str| -> Option<String> {
+                //                     match get_val(k)? {
+                //                         SPValue::String(StringOrUnknown::String(s)) => Some(s.clone()),
+                //                         _ => None,
+                //                     }
+                //                 };
+
+                //                 let get_f64_vec = |k: &str| -> Option<Vec<f64>> {
+                //                     match get_val(k)? {
+                //                         SPValue::Array(ArrayOrUnknown::Array(a)) => {
+                //                             let mut vec = Vec::new();
+                //                             for v in a {
+                //                                 match v {
+                //                                     SPValue::Float64(FloatOrUnknown::Float64(f)) => vec.push(f.into_inner()),
+                //                                     SPValue::Int64(IntOrUnknown::Int64(i)) => vec.push(*i as f64),
+                //                                     _ => return None,
+                //                                 }
+                //                             }
+                //                             Some(vec)
+                //                         }
+                //                         _ => None,
+                //                     }
+                //                 };
+
+                //                 // Build the struct! Since Action::assign already resolved the variables,
+                //                 // `goal_feature_id` here will be the actual string value (e.g. "table_1"), not "var:target"!
+                //                 extracted.push(WaypointRaw {
+                //                     acceleration: get_f64("acceleration")?,
+                //                     velocity: get_f64("velocity")?,
+                //                     global_acceleration_scaling: get_f64("global_acceleration_scaling")?,
+                //                     global_velocity_scaling: get_f64("global_velocity_scaling")?,
+                //                     use_execution_time: get_bool("use_execution_time")?,
+                //                     execution_time: get_f64("execution_time")?,
+                //                     use_blend_radius: get_bool("use_blend_radius")?,
+                //                     blend_radius: get_f64("blend_radius")?,
+                //                     use_joint_positions: get_bool("use_joint_positions")?,
+                //                     joint_positions: get_f64_vec("joint_positions")?,
+                //                     use_preferred_joint_config: get_bool("use_preferred_joint_config")?,
+                //                     preferred_joint_config: get_f64_vec("preferred_joint_config")?,
+                //                     use_relative_pose: get_bool("use_relative_pose")?,
+                //                     relative_pose: get_f64_vec("relative_pose")?,
+                //                     use_payload: get_bool("use_payload")?,
+                //                     payload: get_string("payload")?,
+                //                     baseframe_id: get_string("baseframe_id")?,
+                //                     faceplate_id: get_string("faceplate_id")?,
+                //                     goal_feature_id: get_string("goal_feature_id")?,
+                //                     tcp_id: get_string("tcp_id")?,
+                //                     root_frame_id: get_string("root_frame_id")?,
+                //                     force_threshold: get_f64("force_threshold")?,
+                //                 });
+                //             } else {
+                //                 // If the item in the array is not a Map at all
+                //                 return None;
+                //             }
+                //         }
+
+                //         Some(extracted)
+                //     };
+
+                //     if let Some(valid_waypoints) = extract_all() {
+                //         waypoints_raw = valid_waypoints;
+                //     } else {
+                //         log::warn!(
+                //             target: &log_target,
+                //             "One or more waypoints failed to decode properly. Skipping the entire waypoint trajectory."
+                //         );
+                //     }
+                // }
+
+                // experimantal with printouts:
+                let waypoints_sp = state.get_value(&key("waypoints"), &log_target);
+                let mut waypoints_raw: Vec<WaypointRaw> = vec![];
+
+                if let Some(micro_sp::SPValue::Array(ArrayOrUnknown::Array(arr))) = waypoints_sp {
+                    let mut extract_all = || -> Option<Vec<WaypointRaw>> {
+                        let mut extracted = Vec::with_capacity(arr.len());
+
+                        for (index, item) in arr.iter().enumerate() {
+                            if let micro_sp::SPValue::Map(MapOrUnknown::Map(map)) = item {
+                                // Helper to pull values out of the Map
+                                let get_val = |k: &str| -> Option<&SPValue> {
+                                    map.iter()
+                                        .find(|(key_sp, _)| {
+                                            if let SPValue::String(StringOrUnknown::String(s)) =
+                                                key_sp
+                                            {
+                                                s == k
+                                            } else {
+                                                false
+                                            }
+                                        })
+                                        .map(|(_, val_sp)| val_sp)
+                                };
+
+                                let get_f64 = |k: &str| -> Option<f64> {
+                                    match get_val(k) {
+                                        Some(SPValue::Float64(FloatOrUnknown::Float64(f))) => {
+                                            Some(f.into_inner())
+                                        }
+                                        Some(SPValue::Int64(IntOrUnknown::Int64(i))) => {
+                                            Some(*i as f64)
+                                        }
+                                        Some(other) => {
+                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' failed! Expected Float64/Int64, got: {:?}", index, k, other);
+                                            None
+                                        }
+                                        None => {
+                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
+                                            None
+                                        }
+                                    }
+                                };
+
+                                let get_bool = |k: &str| -> Option<bool> {
+                                    match get_val(k) {
+                                        Some(SPValue::Bool(BoolOrUnknown::Bool(b))) => Some(*b),
+                                        Some(other) => {
+                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' failed! Expected Bool, got: {:?}", index, k, other);
+                                            None
+                                        }
+                                        None => {
+                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
+                                            None
+                                        }
+                                    }
+                                };
+
+                                let get_string = |k: &str| -> Option<String> {
+                                    match get_val(k) {
+                                        Some(SPValue::String(StringOrUnknown::String(s))) => {
+                                            Some(s.clone())
+                                        }
+                                        Some(other) => {
+                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' failed! Expected String, got: {:?}", index, k, other);
+                                            None
+                                        }
+                                        None => {
+                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
+                                            None
+                                        }
+                                    }
+                                };
+
+                                let get_f64_vec = |k: &str| -> Option<Vec<f64>> {
+                                    match get_val(k) {
+                                        Some(SPValue::Array(ArrayOrUnknown::Array(a))) => {
+                                            let mut vec = Vec::new();
+                                            for (i, v) in a.iter().enumerate() {
+                                                match v {
+                                                    SPValue::Float64(FloatOrUnknown::Float64(
+                                                        f,
+                                                    )) => vec.push(f.into_inner()),
+                                                    SPValue::Int64(IntOrUnknown::Int64(val)) => {
+                                                        vec.push(*val as f64)
+                                                    }
+                                                    other => {
+                                                        log::error!(target: &log_target, "Waypoint {}: Field '{}' array element at index {} failed! Expected Float64/Int64, got: {:?}", index, k, i, other);
+                                                        return None;
+                                                    }
+                                                }
+                                            }
+                                            Some(vec)
+                                        }
+                                        Some(other) => {
+                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' failed! Expected Array, got: {:?}", index, k, other);
+                                            None
+                                        }
+                                        None => {
+                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
+                                            None
+                                        }
+                                    }
+                                };
+
+                                // Because the helpers now log before returning None, using `?` here is perfectly fine.
+                                // It will abort on the first failure, but you will already have the log printed.
+                                extracted.push(WaypointRaw {
+                                    acceleration: get_f64("acceleration")?,
+                                    velocity: get_f64("velocity")?,
+                                    global_acceleration_scaling: get_f64(
+                                        "global_acceleration_scaling",
+                                    )?,
+                                    global_velocity_scaling: get_f64("global_velocity_scaling")?,
+                                    use_execution_time: get_bool("use_execution_time")?,
+                                    execution_time: get_f64("execution_time")?,
+                                    use_blend_radius: get_bool("use_blend_radius")?,
+                                    blend_radius: get_f64("blend_radius")?,
+                                    use_joint_positions: get_bool("use_joint_positions")?,
+                                    joint_positions: get_f64_vec("joint_positions")?,
+                                    use_preferred_joint_config: get_bool(
+                                        "use_preferred_joint_config",
+                                    )?,
+                                    preferred_joint_config: get_f64_vec("preferred_joint_config")?,
+                                    use_relative_pose: get_bool("use_relative_pose")?,
+                                    relative_pose: get_f64_vec("relative_pose")?,
+                                    use_payload: get_bool("use_payload")?,
+                                    payload: get_string("payload")?,
+                                    baseframe_id: get_string("baseframe_id")?,
+                                    faceplate_id: get_string("faceplate_id")?,
+                                    goal_feature_id: {
+                                        if use_joint_positions {
+                                            "".to_string()
+                                        } else {
+                                            get_string("goal_feature_id")?
+                                        }
+                                    },
+                                    tcp_id: get_string("tcp_id")?,
+                                    root_frame_id: get_string("root_frame_id")?,
+                                    force_threshold: get_f64("force_threshold")?,
+                                });
+                            } else {
+                                log::error!(target: &log_target, "Waypoint at index {} is NOT a Map! It is: {:?}", index, item);
+                                return None;
+                            }
+                        }
+
+                        Some(extracted)
+                    };
+
+                    if let Some(valid_waypoints) = extract_all() {
+                        waypoints_raw = valid_waypoints;
+                    } else {
+                        log::warn!(
+                            target: &log_target,
+                            "One or more waypoints failed to decode properly. Skipping the entire waypoint trajectory."
+                        );
+                    }
+                } else {
+                    log::error!(target: &log_target, "The waypoints state value was not an Array. Received: {:?}", waypoints_sp);
+                }
+
+                // let waypoints_sp = state.get_value(&key("waypoints"), &log_target);
+                // let mut waypoints_raw: Vec<WaypointRaw> = vec![];
+
+                // if let Some(micro_sp::SPValue::Array(ArrayOrUnknown::Array(arr))) = waypoints_sp {
+                //     let extract_all = || -> Option<Vec<WaypointRaw>> {
+                //         let mut extracted = Vec::with_capacity(arr.len());
+
+                //         for item in arr.iter() {
+                //             if let micro_sp::SPValue::Map(MapOrUnknown::Map(map)) = item {
+                //                 let get_val = |k: &str| -> Option<&SPValue> {
+                //                     map.iter()
+                //                         .find(|(key_sp, _)| {
+                //                             if let SPValue::String(StringOrUnknown::String(s)) =
+                //                                 key_sp
+                //                             {
+                //                                 s == k
+                //                             } else {
+                //                                 false
+                //                             }
+                //                         })
+                //                         .map(|(_, val_sp)| val_sp)
+                //                 };
+
+                //                 let get_f64 = |k: &str| -> Option<f64> {
+                //                     match get_val(k)? {
+                //                         SPValue::Float64(FloatOrUnknown::Float64(f)) => {
+                //                             Some(f.into_inner())
+                //                         }
+                //                         SPValue::Int64(IntOrUnknown::Int64(i)) => Some(*i as f64),
+                //                         _ => None,
+                //                     }
+                //                 };
+
+                //                 let get_bool = |k: &str| -> Option<bool> {
+                //                     match get_val(k)? {
+                //                         SPValue::Bool(BoolOrUnknown::Bool(b)) => Some(*b),
+                //                         _ => None,
+                //                     }
+                //                 };
+
+                //                 let get_string = |k: &str| -> Option<String> {
+                //                     match get_val(k)? {
+                //                         SPValue::String(StringOrUnknown::String(s)) => {
+                //                             Some(s.trim_matches('"').to_string())
+                //                         }
+                //                         _ => None,
+                //                     }
+                //                 };
+
+                //                 let get_f64_vec = |k: &str| -> Option<Vec<f64>> {
+                //                     match get_val(k)? {
+                //                         SPValue::Array(ArrayOrUnknown::Array(a)) => {
+                //                             let mut vec = Vec::new();
+                //                             for v in a {
+                //                                 match v {
+                //                                     SPValue::Float64(FloatOrUnknown::Float64(
+                //                                         f,
+                //                                     )) => vec.push(f.into_inner()),
+                //                                     SPValue::Int64(IntOrUnknown::Int64(i)) => {
+                //                                         vec.push(*i as f64)
+                //                                     }
+                //                                     _ => return None,
+                //                                 }
+                //                             }
+                //                             Some(vec)
+                //                         }
+                //                         _ => None,
+                //                     }
+                //                 };
+
+                //                 extracted.push(WaypointRaw {
+                //                     acceleration: get_f64("acceleration")?,
+                //                     velocity: get_f64("velocity")?,
+                //                     global_acceleration_scaling: get_f64(
+                //                         "global_acceleration_scaling",
+                //                     )?,
+                //                     global_velocity_scaling: get_f64("global_velocity_scaling")?,
+                //                     use_execution_time: get_bool("use_execution_time")?,
+                //                     execution_time: get_f64("execution_time")?,
+                //                     use_blend_radius: get_bool("use_blend_radius")?,
+                //                     blend_radius: get_f64("blend_radius")?,
+                //                     use_joint_positions: get_bool("use_joint_positions")?,
+                //                     joint_positions: get_f64_vec("joint_positions")?,
+                //                     use_preferred_joint_config: get_bool(
+                //                         "use_preferred_joint_config",
+                //                     )?,
+                //                     preferred_joint_config: get_f64_vec("preferred_joint_config")?,
+                //                     use_relative_pose: get_bool("use_relative_pose")?,
+                //                     relative_pose: get_f64_vec("relative_pose")?,
+                //                     use_payload: get_bool("use_payload")?,
+                //                     payload: get_string("payload")?,
+                //                     baseframe_id: get_string("baseframe_id")?,
+                //                     faceplate_id: get_string("faceplate_id")?,
+                //                     goal_feature_id: get_string("goal_feature_id")?,
+                //                     tcp_id: get_string("tcp_id")?,
+                //                     root_frame_id: get_string("root_frame_id")?,
+                //                     force_threshold: get_f64("force_threshold")?,
+                //                 });
+                //             } else {
+                //                 // If the item in the array is not a Map at all
+                //                 return None;
+                //             }
+                //         }
+
+                //         Some(extracted)
+                //     };
+
+                //     if let Some(valid_waypoints) = extract_all() {
+                //         waypoints_raw = valid_waypoints;
+                //     } else {
+                //         log::warn!(
+                //             target: &log_target,
+                //             "One or more waypoints failed to decode properly. Skipping the entire waypoint trajectory."
+                //         );
+                //     }
+                // }
 
                 let mut waypoints = vec![];
                 for wpr in waypoints_raw {
@@ -332,7 +691,7 @@ pub async fn command_server(
                     }
 
                     waypoints.push(Waypoint {
-                        accelleration: wpr.accelleration,
+                        acceleration: wpr.acceleration,
                         velocity: wpr.velocity,
                         global_acceleration_scaling: wpr.global_acceleration_scaling,
                         global_velocity_scaling: wpr.global_velocity_scaling,
@@ -355,7 +714,7 @@ pub async fn command_server(
 
                 let robot_command = RobotCommand {
                     command_type,
-                    accelleration,
+                    acceleration,
                     velocity,
                     global_acceleration_scaling,
                     global_velocity_scaling,

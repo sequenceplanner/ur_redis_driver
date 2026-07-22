@@ -8,7 +8,7 @@ def script():
   set_tcp({{ wp.tcp_in_faceplate }})
   {% if wp.use_joint_positions -%}
   socket_send_line("movej without inverse kinematics starting.", "ur_driver_socket")
-  movej({{ wp.joint_positions }}, a={{ wp.accelleration }}, v={{ wp.velocity }}
+  movej({{ wp.joint_positions }}, a={{ wp.acceleration }}, v={{ wp.velocity }}
   {%- if wp.use_execution_time -%}
   , t={{ wp.execution_time }}
   {%- endif -%}
@@ -25,7 +25,7 @@ def script():
       {%- if wp.use_preferred_joint_config -%}
       , qnear={{ wp.preferred_joint_config }}
       {%- endif -%})
-    , a={{ wp.accelleration }}, v={{ wp.velocity }}
+    , a={{ wp.acceleration }}, v={{ wp.velocity }}
     {%- if wp.use_execution_time -%}
     , t={{ wp.execution_time }}
     {%- endif -%}

@@ -111,7 +111,7 @@ impl fmt::Display for DashboardCommandType {
 // This is to be sent out in the orbot command
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Waypoint {
-    pub accelleration: f64,
+    pub acceleration: f64,
     pub velocity: f64,
     pub global_acceleration_scaling: f64,
     pub global_velocity_scaling: f64,
@@ -134,7 +134,7 @@ pub struct Waypoint {
 // This arrives in the "waypoints" from redis
 #[derive(Serialize, Deserialize, Clone)]
 pub struct WaypointRaw {
-    pub accelleration: f64,
+    pub acceleration: f64,
     pub velocity: f64,
     pub global_acceleration_scaling: f64,
     pub global_velocity_scaling: f64,
@@ -164,7 +164,7 @@ pub struct RobotCommand {
     pub command_type: String,
     // If command is 'move_j', joint acceleration of leading axis [rad/s^2].
     // If command is 'move_l', tool acceleration [m/s^2].
-    pub accelleration: f64,
+    pub acceleration: f64,
     // If command is 'move_j', joint velocity of leading axis [rad/s].
     // If command is 'move_l', tool velocity [m/s].
     pub velocity: f64,

@@ -14,7 +14,7 @@ def script():
   force_detected = False
   
   # Get to the above pick point
-  # movel({{ target_in_base }}, a={{ accelleration }}, v={{ velocity }})
+  # movel({{ target_in_base }}, a={{ acceleration }}, v={{ velocity }})
   
   thread move_down_thread():
     # Move down to make contact
@@ -57,12 +57,12 @@ def script():
   # Define threads for the upward retraction move
   thread move_up_thread():
     # Retract 10cm up after picking
-    movel(pose_trans(get_forward_kin(), p[0.0, 0.0, -0.1, 0.0, 0.0, 0.0]), a={{ accelleration }}, v={{ velocity }})
+    movel(pose_trans(get_forward_kin(), p[0.0, 0.0, -0.1, 0.0, 0.0, 0.0]), a={{ acceleration }}, v={{ velocity }})
     move_done = True
   end
 
   thread force_monitor_up_thread():
-    sleep(0.4) # Wait to ignore forces from initial accelleration
+    sleep(0.4) # Wait to ignore forces from initial acceleration
     while not move_done:
       forces = get_tcp_force()
       # Check for excessive force, e.g., if the part is snagged

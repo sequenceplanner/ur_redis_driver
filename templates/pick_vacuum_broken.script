@@ -14,7 +14,7 @@ def script():
   item_mass_detected = False
   
   thread move_down_thread():
-    movel(pose_trans(get_forward_kin(), p{{ relative_pose }}), a={{ accelleration }}, v={{ velocity }})
+    movel(pose_trans(get_forward_kin(), p{{ relative_pose }}), a={{ acceleration }}, v={{ velocity }})
     move_done = True
   end
 
@@ -45,7 +45,7 @@ def script():
   force_detected = False
 
   thread move_up_thread():
-    movel(pose_trans(get_forward_kin(), p{{ relative_pose }}), a={{ accelleration }}, v={{ velocity }})
+    movel(pose_trans(get_forward_kin(), p{{ relative_pose }}), a={{ acceleration }}, v={{ velocity }})
     move_done = True
   end
 

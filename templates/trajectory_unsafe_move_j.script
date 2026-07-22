@@ -25,7 +25,7 @@ def script():
   set_tcp({{ tcp_in_faceplate }})
   {%- for wp in waypoints %}
   {%- if wp.use_joint_positions %}
-  movej({{ wp.joint_positions }}, a={{ wp.accelleration }}, v={{ wp.velocity }}
+  movej({{ wp.joint_positions }}, a={{ wp.acceleration }}, v={{ wp.velocity }}
   {%- if wp.use_execution_time -%}
   , t={{ wp.execution_time }}
   {%- endif -%}
@@ -37,7 +37,7 @@ def script():
     {%- if wp.use_preferred_joint_config -%}
     , qnear={{ wp.preferred_joint_config }}
     {%- endif -%})
-  , a={{ wp.accelleration }}, v={{ wp.velocity }}
+  , a={{ wp.acceleration }}, v={{ wp.velocity }}
   {%- if wp.use_execution_time -%}
   , t={{ wp.execution_time }}
   {%- endif -%}
