@@ -3,7 +3,7 @@ use k::{Isometry3, Vector3};
 // use micro_sp::management::transforms;
 use micro_sp::{
     ConnectionManager, MapOrUnknown, SPRotation, SPTransform, SPTransformStamped, SPTranslation,
-    ToSPValue, TransformsManager,
+    StateManager, ToSPValue, TransformsManager,
 };
 use ordered_float::OrderedFloat;
 use redis::aio::MultiplexedConnection;
@@ -42,21 +42,41 @@ pub async fn state_publisher(
             )
         };
 
+        // this caused the big error
+        let mut joints_for_tf = joints.clone();
         if !joints.is_empty() {
-            joints[0] += std::f64::consts::PI;
-            // If it rotates the *wrong* way after this, use `-=` instead,
-            // though mathematically PI and -PI result in the same position.
+            joints_for_tf[0] += std::f64::consts::PI;
         }
 
-        publish_joint_states(&joints, &speeds).await;
+        publish_joint_states(&robot_params.name, &joints, &speeds, &mut con).await;
         // let con_clone = con.clone();
-        publish_robot_transforms(&chain, &joints, &mut con).await;
+        publish_robot_transforms(&chain, &joints_for_tf, &mut con).await;
         publish_measured_state(state, prog_state, &forces, inputs, outputs).await;
     }
 }
 
 /// TODO: Implement this to publish/send joint states to your custom system.
-async fn publish_joint_states(joints: &[f64], speeds: &[f64]) {
+async fn publish_joint_states(
+    robot_id: &str,
+    joints: &[f64],
+    speeds: &[f64],
+    con: &mut MultiplexedConnection,
+) {
+
+    // StateManager::set_sp_value(
+    //                 &mut con,
+    //                 &format!("{robot_name}_joint_states"),
+    //                 &joint_states.to_spvalue(),
+    //             )
+    //             .await;
+    let _ = StateManager::set_sp_value(
+        con,
+        &format!("{}_joint_states", &robot_id),
+        &micro_sp::SPValue::Array(micro_sp::ArrayOrUnknown::Array(
+            joints.iter().map(|x| x.to_spvalue()).collect(),
+        )),
+    ).await;
+    // TransformsManager::move_transform(con, &frame_name, relative_transform_sp).await;
     // println!("Joints: {:?}", joints);
     // println!("Speeds: {:?}", speeds);
 }
@@ -167,6 +187,8 @@ pub async fn initialize_visual_transforms(
                     ("mesh_r".to_spvalue(), 0.0.to_spvalue()),
                     ("mesh_g".to_spvalue(), 0.0.to_spvalue()),
                     ("mesh_b".to_spvalue(), 0.0.to_spvalue()),
+                    ("mesh_use_embedded_materials".to_spvalue(), true.to_spvalue()),
+                    
                 ]),
             };
 

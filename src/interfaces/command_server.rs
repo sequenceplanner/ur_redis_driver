@@ -533,9 +533,10 @@ pub async fn command_server(
                             "One or more waypoints failed to decode properly. Skipping the entire waypoint trajectory."
                         );
                     }
-                } else {
-                    log::error!(target: &log_target, "The waypoints state value was not an Array. Received: {:?}", waypoints_sp);
-                }
+                } 
+                // else {
+                //     log::error!(target: &log_target, "The waypoints state value was not an Array. Received: {:?}", waypoints_sp);
+                // }
 
                 // let waypoints_sp = state.get_value(&key("waypoints"), &log_target);
                 // let mut waypoints_raw: Vec<WaypointRaw> = vec![];

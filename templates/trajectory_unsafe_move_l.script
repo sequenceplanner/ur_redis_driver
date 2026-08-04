@@ -1,0 +1,48 @@
+def script():
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  socket_send_line("Validating blended linear trajectory...", "ur_driver_socket")
+  
+  # --- PHASE 1: Validate all IK solutions first ---
+  # Even though movel uses Cartesian interpolation, we ensure all endpoints are reachable before starting.
+  {%- for wp in waypoints %}
+  {%- if not wp.use_joint_positions %}
+  if not get_inverse_kin_has_solution({{ wp.target_in_base }}
+    {%- if wp.use_preferred_joint_config -%}
+    , qnear={{ wp.preferred_joint_config }}
+    {%- endif -%}):
+    socket_send_line("No inverse kinematics solution found for a waypoint, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+  {%- endfor %}
+  
+  socket_send_line("Validation passed. Starting continuous linear motion.", "ur_driver_socket")
+  
+  # --- PHASE 2: Execute uninterrupted motion for successful blending ---
+  # Set the TCP once before the loop to prevent breaking the look-ahead buffer.
+  set_tcp({{ tcp_in_faceplate }})
+  {%- for wp in waypoints %}
+  {%- if wp.use_joint_positions %}
+  # Note: When giving joint positions to movel, the robot computes FK and moves linearly to that Cartesian pose.
+  movel({{ wp.joint_positions }}, a={{ wp.acceleration }}, v={{ wp.velocity }}
+  {%- if wp.use_execution_time -%}
+  , t={{ wp.execution_time }}
+  {%- endif -%}
+  {%- if wp.use_blend_radius -%}
+  , r={{ wp.blend_radius }}
+  {%- endif -%})
+  {%- else %}
+  movel({{ wp.target_in_base }}, a={{ wp.acceleration }}, v={{ wp.velocity }}
+  {%- if wp.use_execution_time -%}
+  , t={{ wp.execution_time }}
+  {%- endif -%}
+  {%- if wp.use_blend_radius -%}
+  , r={{ wp.blend_radius }}
+  {%- endif -%})
+  {%- endif %}
+  {%- endfor %}
+  
+  return True
+end
