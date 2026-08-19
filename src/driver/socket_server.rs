@@ -6,7 +6,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_util::codec::{Framed, LinesCodec};
 
-use crate::{DriverState, UR_DRIVER_SOCKET_PORT};
+use crate::{DriverState, UR_DRIVER_SOCKET_PORT, lock_driver_state};
 
 pub async fn socket_server(
     driver_state: Arc<Mutex<DriverState>>,
@@ -25,11 +25,20 @@ pub async fn socket_server(
 
     let listener = TcpListener::bind(&addr).await?;
     loop {
-        let (stream, addr) = listener.accept().await?;
+        // A failed accept is per-connection (the peer went away mid-handshake, the
+        // fd table is momentarily full) and says nothing about the listener. `?`
+        // here used to end the task and restart the whole driver.
+        let (stream, addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                println!("Failed to accept a script connection: {}", e);
+                continue;
+            }
+        };
         println!("New connection: {}", addr);
 
         let (goal_id, handshake_sender, feedback_sender) = {
-            let mut ds = driver_state.lock().unwrap();
+            let mut ds = lock_driver_state(&driver_state);
             if ds.handshake_sender.is_none() || ds.goal_id.is_none() || ds.feedback_sender.is_none()
             {
                 println!("SHOULD NOT HAPPEN, DROPPING STREAM");
@@ -65,14 +74,14 @@ pub async fn socket_server(
             match lines.next().await {
                 Some(Ok(s)) if s == "ok" => {
                     println!("got OK, we are done.");
-                    let mut ds = driver_state.lock().unwrap();
+                    let mut ds = lock_driver_state(&driver_state);
                     if let Some(goal_sender) = ds.goal_sender.take() {
                         let _ = goal_sender.send(true);
                     }
                 }
                 Some(Ok(s)) if s == "error" => {
                     println!("got ERROR, we are done.");
-                    let mut ds = driver_state.lock().unwrap();
+                    let mut ds = lock_driver_state(&driver_state);
                     if let Some(goal_sender) = ds.goal_sender.take() {
                         let _ = goal_sender.send(false);
                     }
@@ -82,9 +91,27 @@ pub async fn socket_server(
                     let _ = feedback_sender.send(s).await;
                 }
                 _ => {
-                    println!("Socket connection closed, dropping feedback sender.");
-                    let mut ds = driver_state.lock().unwrap();
+                    // The script's socket closing without an "ok"/"error" line means
+                    // the script ended without reporting - it was killed by a
+                    // dashboard `stop`, or the program was aborted on the pendant.
+                    //
+                    // Resolving the goal here is what makes `stop` usable: leaving
+                    // it unresolved parks `handle_request` on `goal_receiver`
+                    // forever, so `goal_id` stays `Some` and *every* later request
+                    // is rejected with "a goal is already running" until the driver
+                    // is restarted.
+                    let mut ds = lock_driver_state(&driver_state);
+                    match ds.goal_sender.take() {
+                        Some(goal_sender) => {
+                            println!("Script socket closed with no result, failing the active goal.");
+                            let _ = goal_sender.send(false);
+                        }
+                        None => {
+                            println!("Socket connection closed, dropping feedback sender.");
+                        }
+                    }
                     ds.feedback_sender = None;
+                    ds.goal_id = None;
                     break;
                 }
             };

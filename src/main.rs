@@ -1,14 +1,18 @@
 use local_ip_address::local_ip;
-use micro_sp::{ConnectionManager, StateManager, initialize_env_logger};
+use micro_sp::{
+    ConnectionManager, DEFAULT_HEALTH_CHECK_PERIOD, StateManager, initialize_env_logger,
+};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-use ur_redis_driver::driver::dashboard::{dashboard, handle_dashboard_commands_loop};
-use ur_redis_driver::driver::socker_server::socket_server;
+use ur_redis_driver::driver::dashboard::dashboard;
+use ur_redis_driver::driver::socket_server::socket_server;
 use ur_redis_driver::interfaces::command_server::command_server;
+use ur_redis_driver::interfaces::dashboard_server::dashboard_server;
 use ur_redis_driver::{
-    DriverState, URDFParameters, generate_robot_interface_state, realtime_reader, state_publisher,
+    DriverState, URDFParameters, generate_robot_interface_state, lock_driver_state, realtime_reader,
+    state_publisher,
 };
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -102,9 +106,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // let gripper_state = generate_gripper_interface_state("g1", &log_target);
     // let state = state.extend(gripper_state, true);
 
-    let connection_manager = ConnectionManager::new().await;
-    StateManager::set_state(&mut connection_manager.get_connection().await, &state).await;
-    let con_arc = Arc::new(connection_manager);
+    // The `Arc` has to exist before the health monitor can be spawned - it takes
+    // `self: &Arc<Self>` so the background task can hold its own reference.
+    let con_arc = Arc::new(ConnectionManager::new().await);
+    let mut con = con_arc.connection();
+    StateManager::set_state(&mut con, &state).await;
+
+    // One PING every few seconds for the whole process, purely so an unreachable
+    // Redis shows up in the log. Nothing depends on it to recover: the handles
+    // handed to the tasks below reconnect themselves. The `JoinHandle` is
+    // dropped deliberately - this task never returns, so it must not be joined
+    // by the `try_join!` at the end of `run`.
+    con_arc.spawn_health_monitor(&log_target, DEFAULT_HEALTH_CHECK_PERIOD);
 
     let (tx_dashboard, rx_dashboard) = mpsc::channel(10);
     let shared_state = Arc::new(Mutex::new(DriverState::new()));
@@ -121,31 +134,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &templates,
     );
 
+    let dashboard_command_server =
+        dashboard_server(&robot_id, &con_arc, tx_dashboard.clone());
+
     let realtime_task = realtime_reader(
         shared_state.clone(),
         ur_address.to_string(),
         override_host_address,
         local_addr_sender,
+        log_target.clone(),
     );
 
     let con_arc_clone = con_arc.clone();
     let state_publisher_task = state_publisher(shared_state.clone(), params, &con_arc_clone);
     let socket_server_task = socket_server(shared_state.clone(), local_addr_receiver.clone());
-    let dashboard_connection = dashboard(rx_dashboard, ur_dashboard_address);
+    let dashboard_connection = dashboard(
+        rx_dashboard,
+        ur_dashboard_address,
+        shared_state.clone(),
+        log_target.clone(),
+    );
 
-    std::fs::File::create("/tmp/robot_controller_ready.flag").unwrap();
+    // A readiness marker for whatever supervises this process. Failing to write it
+    // says nothing about whether the driver can talk to the robot, so it must not
+    // stop startup - this used to be an `.unwrap()`.
+    if let Err(e) = std::fs::File::create("/tmp/robot_controller_ready.flag") {
+        log::warn!(target: &log_target, "Could not write the readiness flag: {}", e);
+    }
 
     let ret = tokio::try_join!(
         command_server,
+        dashboard_command_server,
         realtime_task,
         socket_server_task,
         dashboard_connection,
         state_publisher_task,
-        // dashboard_task,
     );
 
     if let Err(e) = ret {
-        shared_state.lock().unwrap().running = false;
+        lock_driver_state(&shared_state).running = false;
         return Err(e.into());
     }
 

@@ -1,14 +1,168 @@
-use std::fmt;
+use std::sync::{Mutex, MutexGuard};
 use tokio::sync::{mpsc, oneshot};
 
 use micro_sp::*;
 use serde::{Deserialize, Serialize};
-// use tokio::sync::oneshot;
 
+/// Everything the driver can ask the UR Dashboard Server (port 29999) to do.
+///
+/// Variants carrying a `String` take their argument from
+/// `{robot}_dashboard_command_arg`. Query variants (`expect() == None`) return the
+/// controller's raw reply as the payload of `DashboardReply`.
 #[derive(Clone, PartialEq, Debug)]
 pub enum DashboardCommand {
+    // Program control
     Stop,
-    ResetProtectiveStop,
+    Pause,
+    Play,
+    // Power
+    PowerOn,
+    PowerOff,
+    BrakeRelease,
+    // Safety recovery
+    UnlockProtectiveStop,
+    CloseSafetyPopup,
+    ClosePopup,
+    RestartSafety,
+    // Program / installation
+    Load(String),
+    LoadInstallation(String),
+    // Queries
+    RobotMode,
+    SafetyStatus,
+    ProgramState,
+    IsProgramRunning,
+    IsInRemoteControl,
+    GetLoadedProgram,
+    GetRobotModel,
+    PolyscopeVersion,
+    // Misc
+    Popup(String),
+    AddToLog(String),
+    Shutdown,
+}
+
+/// The outcome of one dashboard command.
+///
+/// `response` is the controller's reply line, verbatim and trimmed. For a query
+/// that line *is* the answer; for an action it is kept so a failure can say what
+/// the controller actually said instead of just `false`.
+#[derive(Clone, Debug)]
+pub struct DashboardReply {
+    pub success: bool,
+    pub response: String,
+}
+
+impl DashboardReply {
+    pub fn ok(response: impl Into<String>) -> Self {
+        DashboardReply { success: true, response: response.into() }
+    }
+
+    pub fn fail(response: impl Into<String>) -> Self {
+        DashboardReply { success: false, response: response.into() }
+    }
+}
+
+impl DashboardCommand {
+    /// Map the string written to `{robot}_dashboard_command` onto a command.
+    ///
+    /// `arg` comes from `{robot}_dashboard_command_arg` and is ignored by the
+    /// variants that do not take one.
+    pub fn parse(name: &str, arg: &str) -> Option<Self> {
+        let cmd = match name.trim().to_lowercase().as_str() {
+            "stop" => DashboardCommand::Stop,
+            "pause" => DashboardCommand::Pause,
+            "play" => DashboardCommand::Play,
+            "power_on" => DashboardCommand::PowerOn,
+            "power_off" => DashboardCommand::PowerOff,
+            "brake_release" => DashboardCommand::BrakeRelease,
+            // `reset_protective_stop` is the name the old enum used; keep it as an
+            // alias so anything already written against it keeps working.
+            "unlock_protective_stop" | "reset_protective_stop" => {
+                DashboardCommand::UnlockProtectiveStop
+            }
+            "close_safety_popup" => DashboardCommand::CloseSafetyPopup,
+            "close_popup" => DashboardCommand::ClosePopup,
+            "restart_safety" => DashboardCommand::RestartSafety,
+            "load" => DashboardCommand::Load(arg.to_string()),
+            "load_installation" => DashboardCommand::LoadInstallation(arg.to_string()),
+            "robot_mode" => DashboardCommand::RobotMode,
+            "safety_status" => DashboardCommand::SafetyStatus,
+            "program_state" => DashboardCommand::ProgramState,
+            "is_program_running" => DashboardCommand::IsProgramRunning,
+            "is_in_remote_control" => DashboardCommand::IsInRemoteControl,
+            "get_loaded_program" => DashboardCommand::GetLoadedProgram,
+            "get_robot_model" => DashboardCommand::GetRobotModel,
+            "polyscope_version" => DashboardCommand::PolyscopeVersion,
+            "popup" => DashboardCommand::Popup(arg.to_string()),
+            "add_to_log" => DashboardCommand::AddToLog(arg.to_string()),
+            "shutdown" => DashboardCommand::Shutdown,
+            _ => return None,
+        };
+        Some(cmd)
+    }
+
+    /// The line to write on the socket, without the trailing newline.
+    pub fn wire(&self) -> String {
+        match self {
+            DashboardCommand::Stop => "stop".to_string(),
+            DashboardCommand::Pause => "pause".to_string(),
+            DashboardCommand::Play => "play".to_string(),
+            DashboardCommand::PowerOn => "power on".to_string(),
+            DashboardCommand::PowerOff => "power off".to_string(),
+            DashboardCommand::BrakeRelease => "brake release".to_string(),
+            DashboardCommand::UnlockProtectiveStop => "unlock protective stop".to_string(),
+            DashboardCommand::CloseSafetyPopup => "close safety popup".to_string(),
+            DashboardCommand::ClosePopup => "close popup".to_string(),
+            DashboardCommand::RestartSafety => "restart safety".to_string(),
+            DashboardCommand::Load(p) => format!("load {}", p),
+            DashboardCommand::LoadInstallation(p) => format!("load installation {}", p),
+            DashboardCommand::RobotMode => "robotmode".to_string(),
+            DashboardCommand::SafetyStatus => "safetystatus".to_string(),
+            DashboardCommand::ProgramState => "programState".to_string(),
+            DashboardCommand::IsProgramRunning => "running".to_string(),
+            DashboardCommand::IsInRemoteControl => "is in remote control".to_string(),
+            DashboardCommand::GetLoadedProgram => "get loaded program".to_string(),
+            DashboardCommand::GetRobotModel => "get robot model".to_string(),
+            DashboardCommand::PolyscopeVersion => "PolyscopeVersion".to_string(),
+            DashboardCommand::Popup(t) => format!("popup {}", t),
+            DashboardCommand::AddToLog(t) => format!("addToLog {}", t),
+            DashboardCommand::Shutdown => "shutdown".to_string(),
+        }
+    }
+
+    /// Substring of the reply that means the command took effect.
+    ///
+    /// `None` marks a query: there is no fixed reply to match, so any reply at all
+    /// is a success and the reply itself is the answer.
+    pub fn expect(&self) -> Option<&'static str> {
+        match self {
+            DashboardCommand::Stop => Some("Stopped"),
+            DashboardCommand::Pause => Some("Pausing program"),
+            DashboardCommand::Play => Some("Starting program"),
+            DashboardCommand::PowerOn => Some("Powering on"),
+            DashboardCommand::PowerOff => Some("Powering off"),
+            DashboardCommand::BrakeRelease => Some("Brake releasing"),
+            DashboardCommand::UnlockProtectiveStop => Some("Protective stop releasing"),
+            DashboardCommand::CloseSafetyPopup => Some("closing safety popup"),
+            DashboardCommand::ClosePopup => Some("closing popup"),
+            DashboardCommand::RestartSafety => Some("Restarting safety"),
+            DashboardCommand::Load(_) => Some("Loading program"),
+            DashboardCommand::LoadInstallation(_) => Some("Loading installation"),
+            DashboardCommand::Popup(_) => Some("showing popup"),
+            DashboardCommand::AddToLog(_) => Some("Added log message"),
+            DashboardCommand::Shutdown => Some("Shutting down"),
+            // Queries - the reply is the payload, there is nothing to match.
+            DashboardCommand::RobotMode
+            | DashboardCommand::SafetyStatus
+            | DashboardCommand::ProgramState
+            | DashboardCommand::IsProgramRunning
+            | DashboardCommand::IsInRemoteControl
+            | DashboardCommand::GetLoadedProgram
+            | DashboardCommand::GetRobotModel
+            | DashboardCommand::PolyscopeVersion => None,
+        }
+    }
 }
 
 pub struct ScriptRequest {
@@ -18,15 +172,44 @@ pub struct ScriptRequest {
 
 pub struct DriverState {
     pub running: bool,
+    /// The realtime (30003) stream is up.
     pub connected: bool,
+    /// The dashboard (29999) socket is up.
+    pub dashboard_connected: bool,
+    /// The controller reports it is in Remote Control. Refreshed by the dashboard
+    /// keepalive; dashboard commands like `play` and `brake release` are refused by
+    /// PolyScope when this is false.
+    pub remote_control: bool,
     pub goal_id: Option<String>,
     pub goal_sender: Option<oneshot::Sender<bool>>,
     pub handshake_sender: Option<oneshot::Sender<bool>>,
     pub feedback_sender: Option<mpsc::Sender<String>>,
-    pub robot_state: i32,
-    pub program_state: i32,
+    /// UR *safety* mode, RT packet offset 812. See `safety_mode_name`.
+    ///
+    /// This used to be called `robot_state`, which was a misreading: offset 812 is
+    /// Safety Mode, and Robot Mode is the separate field below.
+    pub safety_mode: i32,
+    /// UR *robot* mode, RT packet offset 756. See `robot_mode_name`.
+    pub robot_mode: i32,
+    /// Raw RT packet offset 1052, kept for diagnostics only.
+    ///
+    /// UR documents this as "Program state", but it does not carry the
+    /// stopped/playing/paused enum the dashboard reports: on PolyScope 5.25 it
+    /// reads 1 with nothing running and 4 with an interface script live. Nothing
+    /// should branch on it - use `program_state` below, which comes from the
+    /// dashboard and is authoritative.
+    pub program_state_raw: i32,
+    /// Program state as the dashboard reports it, e.g. "STOPPED", "PLAYING",
+    /// "PAUSED". Refreshed by the dashboard keepalive.
+    pub program_state: String,
+    /// Whether the controller reports a program as running. Dashboard-sourced.
+    pub program_running: bool,
     pub joint_values: Vec<f64>,
     pub joint_speeds: Vec<f64>,
+    /// Actual TCP pose as [x, y, z, rx, ry, rz], RT packet offset 444.
+    pub tcp_pose: Vec<f64>,
+    /// Active speed scaling (0.0 - 1.0), RT packet offset 940.
+    pub speed_scaling: f64,
     pub digital_inputs: u32,
     pub digital_outputs: u32,
     pub forces: Vec<f64>,
@@ -38,74 +221,87 @@ impl DriverState {
         DriverState {
             running: true,
             connected: false,
+            dashboard_connected: false,
+            remote_control: false,
             goal_id: None,
             goal_sender: None,
             handshake_sender: None,
             feedback_sender: None,
-            robot_state: 0,
-            program_state: 0,
+            safety_mode: 0,
+            robot_mode: 0,
+            program_state_raw: 0,
+            program_state: "UNKNOWN".to_string(),
+            program_running: false,
             joint_values: vec![],
             joint_speeds: vec![],
+            tcp_pose: vec![],
+            speed_scaling: 0.0,
             digital_inputs: 0,
             digital_outputs: 0,
             forces: vec![],
-            cancel_sender: None
+            cancel_sender: None,
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub enum CommandType {
-    UNKNOWN,
-    ConnectGripper,
-    CloseGripper,
-    OpenGripper,
-    MoveL,
-    MoveJ,
-    SafeMoveJ,
-    SafeMoveL,
-    PickVacuum,
-    PlaceVacuum,
-    StartVacuum,
-    StopVacuum,
+/// Take the `DriverState` lock, recovering from poisoning.
+///
+/// Every task in the driver shares this one mutex. With `.lock().unwrap()` a panic
+/// in any single task poisons it and every other task then panics too, which turns
+/// one local bug into a whole-process outage. The data behind the lock is plain
+/// values and channel handles - there is no invariant a panicking writer could
+/// leave half-built - so taking the inner value back is the right recovery.
+pub fn lock_driver_state(driver_state: &Mutex<DriverState>) -> MutexGuard<'_, DriverState> {
+    driver_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub enum DashboardCommandType {
-    UNKNOWN,
-    Stop,
-    ResetProtectiveStop,
-}
-
-impl fmt::Display for CommandType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            CommandType::ConnectGripper => "connect_robotiq_gripper",
-            CommandType::CloseGripper => "close_robotiq_gripper",
-            CommandType::OpenGripper => "open_robotiq_gripper",
-            CommandType::MoveL => "move_l",
-            CommandType::MoveJ => "move_j",
-            CommandType::SafeMoveJ => "safe_move_j",
-            CommandType::SafeMoveL => "safe_move_l",
-            CommandType::PickVacuum => "pick_vacuum",
-            CommandType::PlaceVacuum => "place_vacuum",
-            CommandType::StartVacuum => "start_vacuum",
-            CommandType::StopVacuum => "stop_vacuum",
-            CommandType::UNKNOWN => "unknown",
-        };
-        write!(f, "{}", s)
+/// UR safety mode (RT packet offset 812).
+pub fn safety_mode_name(mode: i32) -> &'static str {
+    match mode {
+        1 => "NORMAL",
+        2 => "REDUCED",
+        3 => "PROTECTIVE_STOP",
+        4 => "RECOVERY",
+        5 => "SAFEGUARD_STOP",
+        6 => "SYSTEM_EMERGENCY_STOP",
+        7 => "ROBOT_EMERGENCY_STOP",
+        8 => "VIOLATION",
+        9 => "FAULT",
+        _ => "UNKNOWN",
     }
 }
 
-impl fmt::Display for DashboardCommandType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            DashboardCommandType::Stop => "stop",
-            DashboardCommandType::ResetProtectiveStop => "reset_protective_stop",
-            DashboardCommandType::UNKNOWN => "unknown",
-        };
-        write!(f, "{}", s)
+/// UR robot mode (RT packet offset 756).
+pub fn robot_mode_name(mode: i32) -> &'static str {
+    match mode {
+        -1 => "NO_CONTROLLER",
+        0 => "DISCONNECTED",
+        1 => "CONFIRM_SAFETY",
+        2 => "BOOTING",
+        3 => "POWER_OFF",
+        4 => "POWER_ON",
+        5 => "IDLE",
+        6 => "BACKDRIVE",
+        7 => "RUNNING",
+        8 => "UPDATING_FIRMWARE",
+        _ => "UNKNOWN",
     }
+}
+
+/// Safety modes in which an in-flight goal can no longer complete.
+///
+/// Deliberately excludes `2 == REDUCED`, which is a normal operating mode: the
+/// robot slows down inside a reduced-speed zone but keeps running. The previous
+/// `safety_mode != 1` test aborted every goal that entered such a zone.
+pub fn safety_mode_aborts_goal(mode: i32) -> bool {
+    matches!(mode, 3 | 5 | 6 | 7 | 8 | 9)
+}
+
+/// Safety modes in which a new motion request may be accepted.
+pub fn safety_mode_accepts_goal(mode: i32) -> bool {
+    matches!(mode, 1 | 2)
 }
 
 // This is to be sent out in the orbot command
@@ -355,4 +551,180 @@ impl Default for URDFParameters {
             ur_meshes_path: "TODO!".to_string(),
         }
     }
+}
+
+impl WaypointRaw {
+    /// Decode `{robot}_waypoints` - an `SPValue::Array` of `SPValue::Map` - into a
+    /// waypoint list.
+    ///
+    /// A blended trajectory is only meaningful as a whole: a waypoint silently
+    /// dropped from the middle changes the path the robot takes. So any field that
+    /// fails to decode aborts the entire list rather than yielding a shorter one,
+    /// and each failure is logged with the waypoint index and field name so the
+    /// offending value can be found without guessing.
+    pub fn vec_from_sp_value(value: Option<SPValue>, log_target: &str) -> Option<Vec<WaypointRaw>> {
+        let SPValue::Array(ArrayOrUnknown::Array(arr)) = value? else {
+            return None;
+        };
+
+        let mut extracted = Vec::with_capacity(arr.len());
+
+        for (index, item) in arr.iter().enumerate() {
+            let SPValue::Map(MapOrUnknown::Map(map)) = item else {
+                log::error!(target: log_target, "Waypoint at index {} is NOT a Map! It is: {:?}", index, item);
+                return None;
+            };
+
+            let get_val = |k: &str| -> Option<&SPValue> {
+                map.iter()
+                    .find(|(key_sp, _)| {
+                        matches!(key_sp, SPValue::String(StringOrUnknown::String(s)) if s == k)
+                    })
+                    .map(|(_, val_sp)| val_sp)
+            };
+
+            let get_f64 = |k: &str| -> Option<f64> {
+                match get_val(k) {
+                    Some(SPValue::Float64(FloatOrUnknown::Float64(f))) => Some(f.into_inner()),
+                    Some(SPValue::Int64(IntOrUnknown::Int64(i))) => Some(*i as f64),
+                    Some(other) => {
+                        log::error!(target: log_target, "Waypoint {}: Field '{}' failed! Expected Float64/Int64, got: {:?}", index, k, other);
+                        None
+                    }
+                    None => {
+                        log::error!(target: log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
+                        None
+                    }
+                }
+            };
+
+            let get_bool = |k: &str| -> Option<bool> {
+                match get_val(k) {
+                    Some(SPValue::Bool(BoolOrUnknown::Bool(b))) => Some(*b),
+                    Some(other) => {
+                        log::error!(target: log_target, "Waypoint {}: Field '{}' failed! Expected Bool, got: {:?}", index, k, other);
+                        None
+                    }
+                    None => {
+                        log::error!(target: log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
+                        None
+                    }
+                }
+            };
+
+            let get_string = |k: &str| -> Option<String> {
+                match get_val(k) {
+                    Some(SPValue::String(StringOrUnknown::String(s))) => Some(s.clone()),
+                    Some(other) => {
+                        log::error!(target: log_target, "Waypoint {}: Field '{}' failed! Expected String, got: {:?}", index, k, other);
+                        None
+                    }
+                    None => {
+                        log::error!(target: log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
+                        None
+                    }
+                }
+            };
+
+            let get_f64_vec = |k: &str| -> Option<Vec<f64>> {
+                match get_val(k) {
+                    Some(SPValue::Array(ArrayOrUnknown::Array(a))) => {
+                        let mut vec = Vec::with_capacity(a.len());
+                        for (i, v) in a.iter().enumerate() {
+                            match v {
+                                SPValue::Float64(FloatOrUnknown::Float64(f)) => {
+                                    vec.push(f.into_inner())
+                                }
+                                SPValue::Int64(IntOrUnknown::Int64(val)) => vec.push(*val as f64),
+                                other => {
+                                    log::error!(target: log_target, "Waypoint {}: Field '{}' array element at index {} failed! Expected Float64/Int64, got: {:?}", index, k, i, other);
+                                    return None;
+                                }
+                            }
+                        }
+                        Some(vec)
+                    }
+                    Some(other) => {
+                        log::error!(target: log_target, "Waypoint {}: Field '{}' failed! Expected Array, got: {:?}", index, k, other);
+                        None
+                    }
+                    None => {
+                        log::error!(target: log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
+                        None
+                    }
+                }
+            };
+
+            let use_joint_positions = get_bool("use_joint_positions")?;
+
+            extracted.push(WaypointRaw {
+                acceleration: get_f64("acceleration")?,
+                velocity: get_f64("velocity")?,
+                global_acceleration_scaling: get_f64("global_acceleration_scaling")?,
+                global_velocity_scaling: get_f64("global_velocity_scaling")?,
+                use_execution_time: get_bool("use_execution_time")?,
+                execution_time: get_f64("execution_time")?,
+                use_blend_radius: get_bool("use_blend_radius")?,
+                blend_radius: get_f64("blend_radius")?,
+                use_joint_positions,
+                joint_positions: get_f64_vec("joint_positions")?,
+                use_preferred_joint_config: get_bool("use_preferred_joint_config")?,
+                preferred_joint_config: get_f64_vec("preferred_joint_config")?,
+                use_relative_pose: get_bool("use_relative_pose")?,
+                relative_pose: get_f64_vec("relative_pose")?,
+                use_payload: get_bool("use_payload")?,
+                payload: get_string("payload")?,
+                baseframe_id: get_string("baseframe_id")?,
+                faceplate_id: get_string("faceplate_id")?,
+                // Moving to joint positions needs no goal frame, and callers leave
+                // it out in that case rather than sending a placeholder.
+                goal_feature_id: if use_joint_positions {
+                    String::new()
+                } else {
+                    get_string("goal_feature_id")?
+                },
+                tcp_id: get_string("tcp_id")?,
+                root_frame_id: get_string("root_frame_id")?,
+                force_threshold: get_f64("force_threshold")?,
+            });
+        }
+
+        Some(extracted)
+    }
+}
+
+/// Read a bool from a `State` that may not contain the key.
+///
+/// `State::get_value` - which every `get_*_or_default_*` accessor funnels through
+/// - logs and then **panics** when a key is absent, and `build_state` silently
+/// drops any key whose stored value fails to deserialize. Together those mean one
+/// malformed value in Redis, hand-written or left over from an older build, takes
+/// down the whole driver rather than failing the one request that touched it.
+///
+/// Checking membership first turns that into the default. A key we seeded at
+/// startup going missing is worth a log line, so it is not silent.
+pub fn state_bool_or(state: &State, key: &str, default: bool, log_target: &str) -> bool {
+    if !state.contains(key) {
+        log::warn!(target: log_target, "'{}' is missing or unreadable, using {}.", key, default);
+        return default;
+    }
+    state.get_bool_or_value(key, default, log_target)
+}
+
+/// Read a string from a `State` that may not contain the key. See `state_bool_or`.
+pub fn state_string_or(state: &State, key: &str, default: &str, log_target: &str) -> String {
+    if !state.contains(key) {
+        log::warn!(target: log_target, "'{}' is missing or unreadable, using '{}'.", key, default);
+        return default.to_string();
+    }
+    state.get_string_or_value(key, default.to_string(), log_target)
+}
+
+/// Read an i64 from a `State` that may not contain the key. See `state_bool_or`.
+pub fn state_int_or(state: &State, key: &str, default: i64, log_target: &str) -> i64 {
+    if !state.contains(key) {
+        log::warn!(target: log_target, "'{}' is missing or unreadable, using {}.", key, default);
+        return default;
+    }
+    state.get_int_or_value(key, default, log_target)
 }

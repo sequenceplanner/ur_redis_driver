@@ -4,24 +4,15 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-
-// use std::net::TcpStream;
-// use std::io;
-
-use futures::StreamExt;
 use micro_sp::*;
 use tokio::{
-    net::tcp,
     sync::{mpsc, oneshot, watch},
-    time::interval,
+    time::{MissedTickBehavior, interval},
 };
 use tokio_util::task::LocalPoolHandle;
 
-// use crate::core::structs::{transform_to_string, CommandType, Payload};
 use crate::{driver::handle_request::handle_request, *};
 
-pub const UR_ACTION_SERVER_TICKER_RATE: u64 = 250;
 pub static SAFE_HOME_JOINT_STATE: [f64; 6] = [0.0, -1.5707, 0.0, -1.5707, 0.0, 0.0];
 pub static DEFAULT_BASEFRAME_ID: &'static str = "base_link"; // base_link if simulation, base if real or ursim
 pub static DEFAULT_FACEPLATE_ID: &'static str = "tool0";
@@ -34,11 +25,20 @@ pub async fn command_server(
     connection_manager: &Arc<ConnectionManager>,
     driver_state: Arc<Mutex<DriverState>>,
     local_addr: &watch::Receiver<Option<SocketAddr>>,
-    dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
+    dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<DashboardReply>)>,
     templates: &tera::Tera,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let log_target = format!("{robot_name}_action_client");
+
+    // Tokio's default missed-tick behaviour is `Burst`: if one tick overruns the
+    // period the interval then fires back-to-back, with no delay, until it has
+    // caught up. At a 10 ms period one slow Redis reply is enough to turn this
+    // loop into a spin that starves every other task on the runtime. `Delay`
+    // keeps a full period between ticks, so a loop that cannot keep up simply
+    // runs slower.
     let mut interval = interval(Duration::from_millis(ROBOT_STATE_UPDATE_INTERVAL_MS.into()));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     let local_pool = LocalPoolHandle::new(1);
 
     let suffixes = [
@@ -71,7 +71,6 @@ pub async fn command_server(
         "use_relative_pose",
         "relative_pose",
         "force_feedback",
-        "reset_request_mechanism",
         "waypoints",
     ];
 
@@ -80,42 +79,70 @@ pub async fn command_server(
         .map(|s| format!("{robot_name}_{s}"))
         .collect();
 
+    // Nothing in the loop body happens unless one of these two is set, so an
+    // idle tick reads just these instead of the whole request key set above.
+    let fast_keys: Vec<String> = ["request_cancel", "request_trigger"]
+        .iter()
+        .map(|s| format!("{robot_name}_{s}"))
+        .collect();
+
+    // One long-lived handle for the whole task rather than one per tick, and no
+    // pre-flight PING before the real work. `SPConnection` is cheap to clone,
+    // multiplexed and self-healing, so this handle stays valid across
+    // reconnects; a dropped socket surfaces as an error on the command itself,
+    // which the callee already logs, and skipping the tick is the right answer.
+    let mut con = connection_manager.get_connection().await;
+
+    let key = |suffix: &str| format!("{robot_name}_{suffix}");
+
     loop {
         interval.tick().await;
-        if connection_manager
-            .check_redis_health(&log_target)
-            .await
-            .is_err()
+
+        // Idle tick: two keys instead of the full set.
+        let flags = match StateManager::get_state_for_keys(&mut con, &fast_keys, &log_target).await
         {
+            Some(s) => s,
+            None => continue,
+        };
+        // These two keys are written by whoever drives the driver, so a malformed
+        // value here is an input error, not an invariant violation. The plain
+        // accessors panic on a key that failed to deserialize; these do not.
+        let cancel_goal = state_bool_or(&flags, &key("request_cancel"), false, &log_target);
+        let triggered = state_bool_or(&flags, &key("request_trigger"), false, &log_target);
+        if !cancel_goal && !triggered {
             continue;
         }
 
-        let mut con = connection_manager.get_connection().await;
         let state = match StateManager::get_state_for_keys(&mut con, &keys, &log_target).await {
             Some(s) => s,
             None => continue,
         };
 
-        let key = |suffix: &str| format!("{robot_name}_{suffix}");
-
-        let cancel_goal = state.get_bool_or_default_to_false(&key("request_cancel"), &log_target);
+        let cancel_goal = state_bool_or(&state, &key("request_cancel"), false, &log_target);
 
         if cancel_goal {
             StateManager::set_sp_value(&mut con, &key("request_cancel"), &false.to_spvalue()).await;
 
-            let mut ds = driver_state.lock().unwrap();
-            if let Some(sender) = ds.cancel_sender.take() {
-                println!("Cancel goal requested from Redis! Aborting active script...");
-                let _ = sender.try_send(());
-            } else {
-                println!("Cancel goal requested, but no active goal is running.");
+            let cancel_sender = lock_driver_state(&driver_state).cancel_sender.take();
+            match cancel_sender {
+                Some(sender) => {
+                    log::info!(target: &log_target, "Cancel requested, aborting the active script.");
+                    let _ = sender.try_send(());
+                }
+                None => {
+                    log::warn!(target: &log_target, "Cancel requested, but no goal is running.");
+                }
             }
         }
 
         let mut request_trigger =
-            state.get_bool_or_default_to_false(&key("request_trigger"), &log_target);
-        let request_state =
-            state.get_string_or_default_to_unknown(&key("request_state"), &log_target);
+            state_bool_or(&state, &key("request_trigger"), false, &log_target);
+        let request_state = state_string_or(
+            &state,
+            &key("request_state"),
+            &ActionRequestState::UNKNOWN.to_string(),
+            &log_target,
+        );
 
         if request_trigger {
             request_trigger = false;
@@ -127,8 +154,48 @@ pub async fn command_server(
             .await;
 
             if request_state == ActionRequestState::Initial.to_string() {
+                // Every accessor below panics on a key that is absent from the
+                // fetched state, and `build_state` drops any key whose stored value
+                // will not deserialize. Checking the whole set once turns a
+                // malformed request parameter into a failed request instead of a
+                // dead driver, and reports every bad key at once rather than the
+                // first one.
+                let missing: Vec<&str> = keys
+                    .iter()
+                    .filter(|k| !state.contains(k))
+                    .map(|k| k.as_str())
+                    .collect();
+                if !missing.is_empty() {
+                    fail_request(
+                        &mut con,
+                        robot_name,
+                        &format!("missing or unreadable request keys: {}", missing.join(", ")),
+                        &log_target,
+                    )
+                    .await;
+                    continue;
+                }
+
                 let command_type =
-                    state.get_string_or_default_to_unknown(&key("command_type"), &log_target);
+                    state_string_or(&state, &key("command_type"), "UNKNOWN", &log_target);
+
+                // The command type is interpolated straight into a template
+                // filename, so an unrecognised one has to be rejected here rather
+                // than left to fail inside Tera - both to keep an arbitrary Redis
+                // string out of a path, and because a render error further down
+                // used to drop the request without ever answering the caller.
+                let template_name = format!("{}.script", command_type);
+                if !templates.get_template_names().any(|n| n == template_name) {
+                    fail_request(
+                        &mut con,
+                        robot_name,
+                        &format!("unknown command_type '{}'", command_type),
+                        &log_target,
+                    )
+                    .await;
+                    continue;
+                }
+
                 let acceleration =
                     state.get_float_or_default_to_zero(&key("acceleration"), &log_target);
                 let velocity = state.get_float_or_default_to_zero(&key("velocity"), &log_target);
@@ -233,7 +300,19 @@ pub async fn command_server(
                     .await
                     {
                         Ok(transform) => transform_to_string(&transform),
-                        Err(_) => continue,
+                        Err(_) => {
+                            fail_request(
+                                &mut con,
+                                robot_name,
+                                &format!(
+                                    "no transform from '{}' to '{}'",
+                                    baseframe_id, goal_feature_id
+                                ),
+                                &log_target,
+                            )
+                            .await;
+                            continue;
+                        }
                     };
 
                     tcp_in_faceplate =
@@ -241,421 +320,44 @@ pub async fn command_server(
                             .await
                         {
                             Ok(transform) => transform_to_string(&transform),
-                            Err(_) => continue,
+                            Err(_) => {
+                                fail_request(
+                                    &mut con,
+                                    robot_name,
+                                    &format!(
+                                        "no transform from '{}' to '{}'",
+                                        faceplate_id, tcp_id
+                                    ),
+                                    &log_target,
+                                )
+                                .await;
+                                continue;
+                            }
                         };
                 }
 
-                // working
-                // let waypoints_raw_str =
-                //     state.get_string_or_default_to_unknown(&key("waypoints"), &log_target);
-
-                // let waypoints_raw: Vec<WaypointRaw> =
-                //     if waypoints_raw_str != "UNKNOWN" && !waypoints_raw_str.is_empty() {
-                //         let valid_json_str = waypoints_raw_str.replace("'", "\"");
-
-                //         match serde_json::from_str(&valid_json_str) {
-                //             Ok(parsed_waypoints) => parsed_waypoints,
-                //             Err(e) => {
-                //                 log::error!(
-                //                     target: &log_target,
-                //                     "Failed to parse waypoints JSON for {}: {}", robot_name, e
-                //                 );
-                //                 vec![]
-                //             }
-                //         }
-                //     } else {
-                //         vec![]
-                //     };
-
-                //experimental but working!
-                // 1. Get the pre-evaluated array from state
-                // let waypoints_sp = state.get_value(&key("waypoints"), &log_target);
-                // let mut waypoints_raw: Vec<WaypointRaw> = vec![];
-
-                // if let Some(micro_sp::SPValue::Array(ArrayOrUnknown::Array(arr))) = waypoints_sp {
-                //     let mut extract_all = || -> Option<Vec<WaypointRaw>> {
-                //         let mut extracted = Vec::with_capacity(arr.len());
-
-                //         for item in arr.iter() {
-                //             if let micro_sp::SPValue::Map(MapOrUnknown::Map(map)) = item {
-                //                 // Helper to pull values out of the Map
-                //                 let get_val = |k: &str| -> Option<&SPValue> {
-                //                     map.iter()
-                //                         .find(|(key_sp, _)| {
-                //                             if let SPValue::String(StringOrUnknown::String(s)) = key_sp {
-                //                                 s == k
-                //                             } else {
-                //                                 false
-                //                             }
-                //                         })
-                //                         .map(|(_, val_sp)| val_sp)
-                //                 };
-
-                //                 let get_f64 = |k: &str| -> Option<f64> {
-                //                     match get_val(k)? {
-                //                         SPValue::Float64(FloatOrUnknown::Float64(f)) => Some(f.into_inner()),
-                //                         SPValue::Int64(IntOrUnknown::Int64(i)) => Some(*i as f64),
-                //                         _ => None,
-                //                     }
-                //                 };
-
-                //                 let get_bool = |k: &str| -> Option<bool> {
-                //                     match get_val(k)? {
-                //                         SPValue::Bool(BoolOrUnknown::Bool(b)) => Some(*b),
-                //                         _ => None,
-                //                     }
-                //                 };
-
-                //                 let get_string = |k: &str| -> Option<String> {
-                //                     match get_val(k)? {
-                //                         SPValue::String(StringOrUnknown::String(s)) => Some(s.clone()),
-                //                         _ => None,
-                //                     }
-                //                 };
-
-                //                 let get_f64_vec = |k: &str| -> Option<Vec<f64>> {
-                //                     match get_val(k)? {
-                //                         SPValue::Array(ArrayOrUnknown::Array(a)) => {
-                //                             let mut vec = Vec::new();
-                //                             for v in a {
-                //                                 match v {
-                //                                     SPValue::Float64(FloatOrUnknown::Float64(f)) => vec.push(f.into_inner()),
-                //                                     SPValue::Int64(IntOrUnknown::Int64(i)) => vec.push(*i as f64),
-                //                                     _ => return None,
-                //                                 }
-                //                             }
-                //                             Some(vec)
-                //                         }
-                //                         _ => None,
-                //                     }
-                //                 };
-
-                //                 // Build the struct! Since Action::assign already resolved the variables,
-                //                 // `goal_feature_id` here will be the actual string value (e.g. "table_1"), not "var:target"!
-                //                 extracted.push(WaypointRaw {
-                //                     acceleration: get_f64("acceleration")?,
-                //                     velocity: get_f64("velocity")?,
-                //                     global_acceleration_scaling: get_f64("global_acceleration_scaling")?,
-                //                     global_velocity_scaling: get_f64("global_velocity_scaling")?,
-                //                     use_execution_time: get_bool("use_execution_time")?,
-                //                     execution_time: get_f64("execution_time")?,
-                //                     use_blend_radius: get_bool("use_blend_radius")?,
-                //                     blend_radius: get_f64("blend_radius")?,
-                //                     use_joint_positions: get_bool("use_joint_positions")?,
-                //                     joint_positions: get_f64_vec("joint_positions")?,
-                //                     use_preferred_joint_config: get_bool("use_preferred_joint_config")?,
-                //                     preferred_joint_config: get_f64_vec("preferred_joint_config")?,
-                //                     use_relative_pose: get_bool("use_relative_pose")?,
-                //                     relative_pose: get_f64_vec("relative_pose")?,
-                //                     use_payload: get_bool("use_payload")?,
-                //                     payload: get_string("payload")?,
-                //                     baseframe_id: get_string("baseframe_id")?,
-                //                     faceplate_id: get_string("faceplate_id")?,
-                //                     goal_feature_id: get_string("goal_feature_id")?,
-                //                     tcp_id: get_string("tcp_id")?,
-                //                     root_frame_id: get_string("root_frame_id")?,
-                //                     force_threshold: get_f64("force_threshold")?,
-                //                 });
-                //             } else {
-                //                 // If the item in the array is not a Map at all
-                //                 return None;
-                //             }
-                //         }
-
-                //         Some(extracted)
-                //     };
-
-                //     if let Some(valid_waypoints) = extract_all() {
-                //         waypoints_raw = valid_waypoints;
-                //     } else {
-                //         log::warn!(
-                //             target: &log_target,
-                //             "One or more waypoints failed to decode properly. Skipping the entire waypoint trajectory."
-                //         );
-                //     }
-                // }
-
-                // experimantal with printouts:
                 let waypoints_sp = state.get_value(&key("waypoints"), &log_target);
-                let mut waypoints_raw: Vec<WaypointRaw> = vec![];
-
-                if let Some(micro_sp::SPValue::Array(ArrayOrUnknown::Array(arr))) = waypoints_sp {
-                    let mut extract_all = || -> Option<Vec<WaypointRaw>> {
-                        let mut extracted = Vec::with_capacity(arr.len());
-
-                        for (index, item) in arr.iter().enumerate() {
-                            if let micro_sp::SPValue::Map(MapOrUnknown::Map(map)) = item {
-                                // Helper to pull values out of the Map
-                                let get_val = |k: &str| -> Option<&SPValue> {
-                                    map.iter()
-                                        .find(|(key_sp, _)| {
-                                            if let SPValue::String(StringOrUnknown::String(s)) =
-                                                key_sp
-                                            {
-                                                s == k
-                                            } else {
-                                                false
-                                            }
-                                        })
-                                        .map(|(_, val_sp)| val_sp)
-                                };
-
-                                let get_f64 = |k: &str| -> Option<f64> {
-                                    match get_val(k) {
-                                        Some(SPValue::Float64(FloatOrUnknown::Float64(f))) => {
-                                            Some(f.into_inner())
-                                        }
-                                        Some(SPValue::Int64(IntOrUnknown::Int64(i))) => {
-                                            Some(*i as f64)
-                                        }
-                                        Some(other) => {
-                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' failed! Expected Float64/Int64, got: {:?}", index, k, other);
-                                            None
-                                        }
-                                        None => {
-                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
-                                            None
-                                        }
-                                    }
-                                };
-
-                                let get_bool = |k: &str| -> Option<bool> {
-                                    match get_val(k) {
-                                        Some(SPValue::Bool(BoolOrUnknown::Bool(b))) => Some(*b),
-                                        Some(other) => {
-                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' failed! Expected Bool, got: {:?}", index, k, other);
-                                            None
-                                        }
-                                        None => {
-                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
-                                            None
-                                        }
-                                    }
-                                };
-
-                                let get_string = |k: &str| -> Option<String> {
-                                    match get_val(k) {
-                                        Some(SPValue::String(StringOrUnknown::String(s))) => {
-                                            Some(s.clone())
-                                        }
-                                        Some(other) => {
-                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' failed! Expected String, got: {:?}", index, k, other);
-                                            None
-                                        }
-                                        None => {
-                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
-                                            None
-                                        }
-                                    }
-                                };
-
-                                let get_f64_vec = |k: &str| -> Option<Vec<f64>> {
-                                    match get_val(k) {
-                                        Some(SPValue::Array(ArrayOrUnknown::Array(a))) => {
-                                            let mut vec = Vec::new();
-                                            for (i, v) in a.iter().enumerate() {
-                                                match v {
-                                                    SPValue::Float64(FloatOrUnknown::Float64(
-                                                        f,
-                                                    )) => vec.push(f.into_inner()),
-                                                    SPValue::Int64(IntOrUnknown::Int64(val)) => {
-                                                        vec.push(*val as f64)
-                                                    }
-                                                    other => {
-                                                        log::error!(target: &log_target, "Waypoint {}: Field '{}' array element at index {} failed! Expected Float64/Int64, got: {:?}", index, k, i, other);
-                                                        return None;
-                                                    }
-                                                }
-                                            }
-                                            Some(vec)
-                                        }
-                                        Some(other) => {
-                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' failed! Expected Array, got: {:?}", index, k, other);
-                                            None
-                                        }
-                                        None => {
-                                            log::error!(target: &log_target, "Waypoint {}: Field '{}' is MISSING from the map!", index, k);
-                                            None
-                                        }
-                                    }
-                                };
-
-                                // Because the helpers now log before returning None, using `?` here is perfectly fine.
-                                // It will abort on the first failure, but you will already have the log printed.
-                                extracted.push(WaypointRaw {
-                                    acceleration: get_f64("acceleration")?,
-                                    velocity: get_f64("velocity")?,
-                                    global_acceleration_scaling: get_f64(
-                                        "global_acceleration_scaling",
-                                    )?,
-                                    global_velocity_scaling: get_f64("global_velocity_scaling")?,
-                                    use_execution_time: get_bool("use_execution_time")?,
-                                    execution_time: get_f64("execution_time")?,
-                                    use_blend_radius: get_bool("use_blend_radius")?,
-                                    blend_radius: get_f64("blend_radius")?,
-                                    use_joint_positions: get_bool("use_joint_positions")?,
-                                    joint_positions: get_f64_vec("joint_positions")?,
-                                    use_preferred_joint_config: get_bool(
-                                        "use_preferred_joint_config",
-                                    )?,
-                                    preferred_joint_config: get_f64_vec("preferred_joint_config")?,
-                                    use_relative_pose: get_bool("use_relative_pose")?,
-                                    relative_pose: get_f64_vec("relative_pose")?,
-                                    use_payload: get_bool("use_payload")?,
-                                    payload: get_string("payload")?,
-                                    baseframe_id: get_string("baseframe_id")?,
-                                    faceplate_id: get_string("faceplate_id")?,
-                                    goal_feature_id: {
-                                        if use_joint_positions {
-                                            "".to_string()
-                                        } else {
-                                            get_string("goal_feature_id")?
-                                        }
-                                    },
-                                    tcp_id: get_string("tcp_id")?,
-                                    root_frame_id: get_string("root_frame_id")?,
-                                    force_threshold: get_f64("force_threshold")?,
-                                });
-                            } else {
-                                log::error!(target: &log_target, "Waypoint at index {} is NOT a Map! It is: {:?}", index, item);
-                                return None;
-                            }
+                let waypoints_raw = match waypoints_sp {
+                    // Absent or non-array simply means "no waypoints", which every
+                    // non-trajectory command is.
+                    None | Some(SPValue::Array(ArrayOrUnknown::UNKNOWN)) => vec![],
+                    other => match WaypointRaw::vec_from_sp_value(other, &log_target) {
+                        Some(waypoints) => waypoints,
+                        None => {
+                            fail_request(
+                                &mut con,
+                                robot_name,
+                                "one or more waypoints failed to decode",
+                                &log_target,
+                            )
+                            .await;
+                            continue;
                         }
+                    },
+                };
 
-                        Some(extracted)
-                    };
-
-                    if let Some(valid_waypoints) = extract_all() {
-                        waypoints_raw = valid_waypoints;
-                    } else {
-                        log::warn!(
-                            target: &log_target,
-                            "One or more waypoints failed to decode properly. Skipping the entire waypoint trajectory."
-                        );
-                    }
-                } 
-                // else {
-                //     log::error!(target: &log_target, "The waypoints state value was not an Array. Received: {:?}", waypoints_sp);
-                // }
-
-                // let waypoints_sp = state.get_value(&key("waypoints"), &log_target);
-                // let mut waypoints_raw: Vec<WaypointRaw> = vec![];
-
-                // if let Some(micro_sp::SPValue::Array(ArrayOrUnknown::Array(arr))) = waypoints_sp {
-                //     let extract_all = || -> Option<Vec<WaypointRaw>> {
-                //         let mut extracted = Vec::with_capacity(arr.len());
-
-                //         for item in arr.iter() {
-                //             if let micro_sp::SPValue::Map(MapOrUnknown::Map(map)) = item {
-                //                 let get_val = |k: &str| -> Option<&SPValue> {
-                //                     map.iter()
-                //                         .find(|(key_sp, _)| {
-                //                             if let SPValue::String(StringOrUnknown::String(s)) =
-                //                                 key_sp
-                //                             {
-                //                                 s == k
-                //                             } else {
-                //                                 false
-                //                             }
-                //                         })
-                //                         .map(|(_, val_sp)| val_sp)
-                //                 };
-
-                //                 let get_f64 = |k: &str| -> Option<f64> {
-                //                     match get_val(k)? {
-                //                         SPValue::Float64(FloatOrUnknown::Float64(f)) => {
-                //                             Some(f.into_inner())
-                //                         }
-                //                         SPValue::Int64(IntOrUnknown::Int64(i)) => Some(*i as f64),
-                //                         _ => None,
-                //                     }
-                //                 };
-
-                //                 let get_bool = |k: &str| -> Option<bool> {
-                //                     match get_val(k)? {
-                //                         SPValue::Bool(BoolOrUnknown::Bool(b)) => Some(*b),
-                //                         _ => None,
-                //                     }
-                //                 };
-
-                //                 let get_string = |k: &str| -> Option<String> {
-                //                     match get_val(k)? {
-                //                         SPValue::String(StringOrUnknown::String(s)) => {
-                //                             Some(s.trim_matches('"').to_string())
-                //                         }
-                //                         _ => None,
-                //                     }
-                //                 };
-
-                //                 let get_f64_vec = |k: &str| -> Option<Vec<f64>> {
-                //                     match get_val(k)? {
-                //                         SPValue::Array(ArrayOrUnknown::Array(a)) => {
-                //                             let mut vec = Vec::new();
-                //                             for v in a {
-                //                                 match v {
-                //                                     SPValue::Float64(FloatOrUnknown::Float64(
-                //                                         f,
-                //                                     )) => vec.push(f.into_inner()),
-                //                                     SPValue::Int64(IntOrUnknown::Int64(i)) => {
-                //                                         vec.push(*i as f64)
-                //                                     }
-                //                                     _ => return None,
-                //                                 }
-                //                             }
-                //                             Some(vec)
-                //                         }
-                //                         _ => None,
-                //                     }
-                //                 };
-
-                //                 extracted.push(WaypointRaw {
-                //                     acceleration: get_f64("acceleration")?,
-                //                     velocity: get_f64("velocity")?,
-                //                     global_acceleration_scaling: get_f64(
-                //                         "global_acceleration_scaling",
-                //                     )?,
-                //                     global_velocity_scaling: get_f64("global_velocity_scaling")?,
-                //                     use_execution_time: get_bool("use_execution_time")?,
-                //                     execution_time: get_f64("execution_time")?,
-                //                     use_blend_radius: get_bool("use_blend_radius")?,
-                //                     blend_radius: get_f64("blend_radius")?,
-                //                     use_joint_positions: get_bool("use_joint_positions")?,
-                //                     joint_positions: get_f64_vec("joint_positions")?,
-                //                     use_preferred_joint_config: get_bool(
-                //                         "use_preferred_joint_config",
-                //                     )?,
-                //                     preferred_joint_config: get_f64_vec("preferred_joint_config")?,
-                //                     use_relative_pose: get_bool("use_relative_pose")?,
-                //                     relative_pose: get_f64_vec("relative_pose")?,
-                //                     use_payload: get_bool("use_payload")?,
-                //                     payload: get_string("payload")?,
-                //                     baseframe_id: get_string("baseframe_id")?,
-                //                     faceplate_id: get_string("faceplate_id")?,
-                //                     goal_feature_id: get_string("goal_feature_id")?,
-                //                     tcp_id: get_string("tcp_id")?,
-                //                     root_frame_id: get_string("root_frame_id")?,
-                //                     force_threshold: get_f64("force_threshold")?,
-                //                 });
-                //             } else {
-                //                 // If the item in the array is not a Map at all
-                //                 return None;
-                //             }
-                //         }
-
-                //         Some(extracted)
-                //     };
-
-                //     if let Some(valid_waypoints) = extract_all() {
-                //         waypoints_raw = valid_waypoints;
-                //     } else {
-                //         log::warn!(
-                //             target: &log_target,
-                //             "One or more waypoints failed to decode properly. Skipping the entire waypoint trajectory."
-                //         );
-                //     }
-                // }
-
-                let mut waypoints = vec![];
+                let mut waypoints = Vec::with_capacity(waypoints_raw.len());
+                let mut waypoint_error = None;
                 for wpr in waypoints_raw {
                     let mut wp_target_in_base = transform_to_string(&SPTransformStamped {
                         active_transform: true,
@@ -676,7 +378,13 @@ pub async fn command_server(
                         .await
                         {
                             Ok(transform) => transform_to_string(&transform),
-                            Err(_) => continue,
+                            Err(_) => {
+                                waypoint_error = Some(format!(
+                                    "no transform from '{}' to waypoint frame '{}'",
+                                    baseframe_id, wpr.goal_feature_id
+                                ));
+                                break;
+                            }
                         };
 
                         tcp_in_faceplate = match TransformsManager::lookup_transform(
@@ -687,7 +395,13 @@ pub async fn command_server(
                         .await
                         {
                             Ok(transform) => transform_to_string(&transform),
-                            Err(_) => continue,
+                            Err(_) => {
+                                waypoint_error = Some(format!(
+                                    "no transform from '{}' to '{}'",
+                                    faceplate_id, tcp_id
+                                ));
+                                break;
+                            }
                         };
                     }
 
@@ -713,6 +427,13 @@ pub async fn command_server(
                     });
                 }
 
+                // A blended trajectory with a waypoint missing is a different path,
+                // not a shorter one, so a failed lookup fails the whole request.
+                if let Some(reason) = waypoint_error {
+                    fail_request(&mut con, robot_name, &reason, &log_target).await;
+                    continue;
+                }
+
                 let robot_command = RobotCommand {
                     command_type,
                     acceleration,
@@ -736,51 +457,67 @@ pub async fn command_server(
                     waypoints,
                 };
 
-                let script = match generate_core_script_from_template(
-                    robot_name,
-                    robot_command,
-                    templates,
-                ) {
-                    Ok(script) => script,
-                    Err(_) => {
-                        log::error!(target: &&format!("robot"), 
-                                "Failed to generate UR Script.");
-                        continue;
-                    }
-                };
+                let script =
+                    match generate_core_script_from_template(robot_name, robot_command, templates) {
+                        Ok(script) => script,
+                        Err(e) => {
+                            fail_request(
+                                &mut con,
+                                robot_name,
+                                &format!("failed to render the UR Script template: {}", e),
+                                &log_target,
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
 
                 let local_addr = local_addr.borrow().clone();
 
                 // For now just generate a uuid for each request here, but ideally from upstream
                 let uuid = nanoid::nanoid!(10, &NANOID_ALPHABET);
-                if local_addr.is_none() || !driver_state.lock().unwrap().connected {
-                    println!("Not connected to robot yet, rejecting request: {}", uuid);
-                    publish_script_result(&uuid, false);
+
+                // Admission control. Each rejection has to write a terminal state:
+                // the trigger was already consumed above, so a caller waiting on
+                // `request_state` would otherwise sit at `initial` forever.
+                let rejection = {
+                    let ds = lock_driver_state(&driver_state);
+                    if local_addr.is_none() || !ds.connected {
+                        Some("not connected to the robot".to_string())
+                    } else if !safety_mode_accepts_goal(ds.safety_mode) {
+                        Some(format!(
+                            "robot safety mode is {}",
+                            safety_mode_name(ds.safety_mode)
+                        ))
+                    } else if ds.goal_id.is_some() {
+                        Some("a goal is already running".to_string())
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(reason) = rejection {
+                    log::warn!(target: &log_target, "Rejecting request {}: {}.", uuid, reason);
+                    fail_request(&mut con, robot_name, &reason, &log_target).await;
                     continue;
                 }
+
+                // Checked as `Some` in the block above.
                 let local_addr_str = local_addr.unwrap().ip().to_string();
 
-                if driver_state.lock().unwrap().robot_state != 1 {
-                    println!("Robot not in normal mode, rejecting request: {}", uuid);
-                    publish_script_result(&uuid, false);
-                    continue;
-                }
+                log::info!(target: &log_target, "Accepting goal request with goal id: {}", uuid);
 
-                if driver_state.lock().unwrap().goal_id.is_some() {
-                    println!("Already have an active goal, rejecting request: {}", uuid);
-                    publish_script_result(&uuid, false);
-                    continue;
-                }
-
-                println!("Accepting goal request with goal id: {}", uuid);
+                StateManager::set_sp_value(
+                    &mut con,
+                    &key("request_state"),
+                    &ActionRequestState::Executing.to_string().to_spvalue(),
+                )
+                .await;
 
                 // Note: If you want cancellation, you must hook `cancel_sender` up to your custom interface.
                 let (cancel_sender, cancel_receiver) = mpsc::channel(1);
 
-                {
-                    let mut ds = driver_state.lock().unwrap();
-                    ds.cancel_sender = Some(cancel_sender);
-                }
+                lock_driver_state(&driver_state).cancel_sender = Some(cancel_sender);
 
                 let req = ScriptRequest { uuid, script };
 
@@ -789,7 +526,6 @@ pub async fn command_server(
                 let task_driver_state = driver_state.clone();
 
                 let con_clone = con.clone();
-                // let keys_clone = keys.clone();
                 let robot_name_clone = robot_name.to_string().clone();
                 local_pool.spawn_pinned(move || async {
                     let result = handle_request(
@@ -808,25 +544,84 @@ pub async fn command_server(
                         println!("Error while handing goal: {}", e);
                     }
                 });
-
-                // call the urscript driver here
             }
         }
     }
 }
 
-/// TODO: Implement this to handle script execution feedback (e.g., standard output/errors).
-pub fn publish_script_feedback(uuid: &str, feedback: &str) {
-    println!("Script [{}] Feedback: {}", uuid, feedback);
+/// Terminate a request that never made it to the robot.
+///
+/// Every early exit in the loop above has already consumed `request_trigger`, so
+/// without this the caller is left watching a `request_state` that will never
+/// leave `initial`. The reason is written to `request_result` so the failure is
+/// diagnosable from Redis rather than only from this process's log.
+pub async fn fail_request(
+    con: &mut SPConnection,
+    robot_name: &str,
+    reason: &str,
+    log_target: &str,
+) {
+    log::error!(target: log_target, "Request failed: {}.", reason);
+
+    let counter_keys = vec![
+        format!("{robot_name}_total_fail_counter"),
+        format!("{robot_name}_subsequent_fail_counter"),
+    ];
+
+    // Read-modify-write on the failure path only, so the happy path pays nothing
+    // for it.
+    if let Some(counters) =
+        StateManager::get_state_for_keys(con, &counter_keys, log_target).await
+    {
+        let total = state_int_or(&counters, &counter_keys[0], 0, log_target);
+        let subsequent = state_int_or(&counters, &counter_keys[1], 0, log_target);
+        StateManager::set_sp_value(con, &counter_keys[0], &(total + 1).to_spvalue()).await;
+        StateManager::set_sp_value(con, &counter_keys[1], &(subsequent + 1).to_spvalue()).await;
+    }
+
+    publish_script_result(con, robot_name, reason, false).await;
 }
 
-/// TODO: Implement this to handle script completion results.
-pub fn publish_script_result(uuid: &str, success: bool) {
-    println!("Script [{}] Result: {}", uuid, success);
+/// Publish a feedback line emitted by the running UR Script.
+pub async fn publish_script_feedback(
+    con: &mut SPConnection,
+    robot_name: &str,
+    uuid: &str,
+    feedback: &str,
+) {
+    log::info!(target: &format!("{robot_name}_action_client"), "Script [{}] feedback: {}", uuid, feedback);
+    StateManager::set_sp_value(
+        con,
+        &format!("{robot_name}_request_feedback"),
+        &feedback.to_spvalue(),
+    )
+    .await;
 }
 
-/// TODO: Implement this to yield new script requests from your custom interface.
-async fn wait_for_script_request() -> Option<ScriptRequest> {
-    // Example: Read from a custom channel or API
-    std::future::pending().await
+/// Publish the outcome of a request.
+///
+/// Only writes `request_result`; the caller owns `request_state`, because the two
+/// have different writers on the success path (`handle_request`) and the rejection
+/// path (`fail_request`).
+pub async fn publish_script_result(
+    con: &mut SPConnection,
+    robot_name: &str,
+    result: &str,
+    success: bool,
+) {
+    StateManager::set_sp_value(
+        con,
+        &format!("{robot_name}_request_result"),
+        &result.to_spvalue(),
+    )
+    .await;
+
+    if !success {
+        StateManager::set_sp_value(
+            con,
+            &format!("{robot_name}_request_state"),
+            &ActionRequestState::Failed.to_string().to_spvalue(),
+        )
+        .await;
+    }
 }

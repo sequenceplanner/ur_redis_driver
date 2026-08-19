@@ -6,21 +6,31 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let request_trigger = bv!(&&format!("{}_request_trigger", robot_name));
     let request_state = v!(&&format!("{}_request_state", robot_name));
     let request_cancel = bv!(&&format!("{}_request_cancel", robot_name));
-    let request_result = bv!(&&format!("{}_request_result", robot_name));
+    // `command_server` has always read `request_result` and `request_feedback`, but
+    // neither was ever seeded here, so both silently fell through to defaults and
+    // no caller could see why a request failed.
+    let request_result = v!(&&format!("{}_request_result", robot_name));
+    let request_feedback = v!(&&format!("{}_request_feedback", robot_name));
     let dashboard_request_trigger = bv!(&&format!("{}_dashboard_request_trigger", robot_name));
     let dashboard_request_state = v!(&&format!("{}_dashboard_request_state", robot_name));
     let dashboard_request_cancel = bv!(&&format!("{}_dashboard_request_cancel", robot_name));
     let dashboard_command = v!(&&format!("{}_dashboard_command", robot_name));
+    let dashboard_command_arg = v!(&&format!("{}_dashboard_command_arg", robot_name));
+    let dashboard_request_result = v!(&&format!("{}_dashboard_request_result", robot_name));
     let total_fail_counter = iv!(&&format!("{}_total_fail_counter", robot_name));
     let subsequent_fail_counter = iv!(&&format!("{}_subsequent_fail_counter", robot_name));
 
     let state = state.add(assign!(request_trigger, false.to_spvalue()), &log_target);
     let state = state.add(assign!(request_state, "initial".to_spvalue()), &log_target);
     let state = state.add(assign!(request_cancel, false.to_spvalue()), &log_target);
+    let state = state.add(assign!(request_result, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(request_feedback, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(dashboard_request_trigger, false.to_spvalue()), &log_target);
     let state = state.add(assign!(dashboard_request_state, "initial".to_spvalue()), &log_target);
     let state = state.add(assign!(dashboard_request_cancel, false.to_spvalue()), &log_target);
     let state = state.add(assign!(dashboard_command, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(dashboard_command_arg, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(dashboard_request_result, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(total_fail_counter, 0.to_spvalue()), &log_target);
     let state = state.add(assign!(subsequent_fail_counter, 0.to_spvalue()), &log_target);
 
@@ -56,6 +66,21 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let gripper_ref_pos_percentage = iv!(&&format!("{}_gripper_ref_pos_percentage", robot_name));
     let waypoints = av!(&&format!("{}_waypoints", robot_name));
 
+    // Measured state, written by `state_publisher` from what `realtime_reader`
+    // decodes off the RT stream. None of this used to leave the process.
+    let safety_mode = v!(&&format!("{}_safety_mode", robot_name));
+    let robot_mode = v!(&&format!("{}_robot_mode", robot_name));
+    let program_state = v!(&&format!("{}_program_state", robot_name));
+    let program_running = bv!(&&format!("{}_program_running", robot_name));
+    let tcp_pose = av!(&&format!("{}_tcp_pose", robot_name));
+    let tcp_force = av!(&&format!("{}_tcp_force", robot_name));
+    let speed_scaling = fv!(&&format!("{}_speed_scaling", robot_name));
+    let digital_inputs = iv!(&&format!("{}_digital_inputs", robot_name));
+    let digital_outputs = iv!(&&format!("{}_digital_outputs", robot_name));
+    let robot_connected = bv!(&&format!("{}_robot_connected", robot_name));
+    let dashboard_connected = bv!(&&format!("{}_dashboard_connected", robot_name));
+    let remote_control = bv!(&&format!("{}_remote_control", robot_name));
+
     let state = state.add(assign!(command_type, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(acceleration, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(velocity, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
@@ -87,6 +112,19 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let state = state.add(assign!(gripper_velocity, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(gripper_ref_pos_percentage, SPValue::Int64(IntOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(waypoints, SPValue::Array(ArrayOrUnknown::UNKNOWN)), &log_target);
+
+    let state = state.add(assign!(safety_mode, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(robot_mode, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(program_state, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(program_running, false.to_spvalue()), &log_target);
+    let state = state.add(assign!(tcp_pose, SPValue::Array(ArrayOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(tcp_force, SPValue::Array(ArrayOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(speed_scaling, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(digital_inputs, SPValue::Int64(IntOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(digital_outputs, SPValue::Int64(IntOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(robot_connected, false.to_spvalue()), &log_target);
+    let state = state.add(assign!(dashboard_connected, false.to_spvalue()), &log_target);
+    let state = state.add(assign!(remote_control, false.to_spvalue()), &log_target);
 
     state
 }

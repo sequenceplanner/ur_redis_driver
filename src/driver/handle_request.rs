@@ -1,7 +1,6 @@
 use futures::FutureExt;
 use futures::future::{self, Either};
-use micro_sp::{ActionRequestState, StateManager, ToSPValue};
-use redis::aio::MultiplexedConnection;
+use micro_sp::{ActionRequestState, SPConnection, StateManager, ToSPValue};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -9,18 +8,23 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
-use crate::interfaces::command_server::{publish_script_feedback, publish_script_result};
-use crate::{DashboardCommand, DriverState, ScriptRequest, generate_ur_script};
+use crate::interfaces::command_server::{
+    fail_request, publish_script_feedback, publish_script_result,
+};
+use crate::{
+    DashboardCommand, DashboardReply, DriverState, ScriptRequest, generate_ur_script,
+    lock_driver_state,
+};
 
 pub async fn handle_request(
     ur_address: String,
     robot_name: String,
     host_address: String,
     driver_state: Arc<Mutex<DriverState>>,
-    dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<bool>)>,
+    dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<DashboardReply>)>,
     req: ScriptRequest,
     mut cancel_receiver: mpsc::Receiver<()>,
-    mut con: MultiplexedConnection,
+    mut con: SPConnection,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let key = |suffix: &str| format!("{robot_name}_{suffix}");
     let (goal_sender, goal_receiver) = oneshot::channel::<bool>();
@@ -41,7 +45,7 @@ pub async fn handle_request(
     let (feedback_sender, mut feedback_receiver) = tokio::sync::mpsc::channel(5);
 
     {
-        let mut ds = driver_state.lock().unwrap();
+        let mut ds = lock_driver_state(&driver_state);
         ds.goal_id = Some(req.uuid.clone());
         ds.goal_sender = Some(goal_sender);
         ds.handshake_sender = Some(handshake_sender);
@@ -64,10 +68,23 @@ pub async fn handle_request(
                 println!("HANDSHAKE OK, PERFORM NOMINAL");
 
                 let req_uuid = req.uuid.clone();
-                let publish_feedback_fut = async {
+                // Its own handle, because `con` below is borrowed mutably for the
+                // terminal state write. `SPConnection` is a cheap-to-clone
+                // multiplexed handle, so this is not a second socket.
+                let mut feedback_con = con.clone();
+                let feedback_robot_name = robot_name.clone();
+                let publish_feedback_fut = async move {
                     loop {
                         match feedback_receiver.recv().await {
-                            Some(msg) => publish_script_feedback(&req_uuid, &msg),
+                            Some(msg) => {
+                                publish_script_feedback(
+                                    &mut feedback_con,
+                                    &feedback_robot_name,
+                                    &req_uuid,
+                                    &msg,
+                                )
+                                .await
+                            }
                             None => return Result::<(), Box<dyn std::error::Error>>::Ok(()),
                         }
                     }
@@ -78,37 +95,69 @@ pub async fn handle_request(
 
                 match future::select(nominal, cancel_receiver.recv().boxed()).await {
                     Either::Left(((res, _), _cancel_stream)) => {
-                        if let Ok(ok) = res {
-                            println!("goal completed. result: {}", ok);
-                            (ok, ResultType::SUCCEDED)
-                        } else {
-                            println!("future appears canceled, abort.");
-                            (false, ResultType::ABORTED)
+                        // The goal channel carries the script's own verdict: `true`
+                        // for the "ok" line, `false` for "error" or for the socket
+                        // closing without a result (a dashboard `stop`, an abort on
+                        // the pendant). Mapping every resolved value to SUCCEDED -
+                        // as this did - reported a failed or externally stopped move
+                        // as `succeeded` in Redis, which is worse than reporting
+                        // nothing at all.
+                        match res {
+                            Ok(true) => {
+                                println!("goal completed successfully.");
+                                (true, ResultType::SUCCEDED)
+                            }
+                            Ok(false) => {
+                                println!("goal ended without success, abort.");
+                                (false, ResultType::ABORTED)
+                            }
+                            Err(_) => {
+                                println!("future appears canceled, abort.");
+                                (false, ResultType::ABORTED)
+                            }
                         }
                     }
                     Either::Right((_cancel_req, nominal)) => {
                         println!("got cancel request: {}", req.uuid);
                         let (sender, ds_cancel_receiver) = oneshot::channel();
-                        dashboard_commands
-                            .try_send((DashboardCommand::Stop, sender))
-                            .expect("could not send dashboard stop");
+                        // `try_send` used to be followed by `.expect`, which turned a
+                        // momentarily full 10-slot channel - or a dashboard task
+                        // that is mid-reconnect - into a panic that poisoned the
+                        // shared `DriverState` mutex for every other task.
+                        if let Err(e) = dashboard_commands.try_send((DashboardCommand::Stop, sender))
+                        {
+                            log::error!(
+                                target: &log_target,
+                                "Could not send the dashboard stop for goal {}: {}. The script may still be running.",
+                                req.uuid, e
+                            );
+                        }
 
                         match future::select(ds_cancel_receiver, nominal).await {
                             Either::Left((res, _nominal)) => {
-                                if let Ok(ok) = res {
-                                    (ok, ResultType::CANCELED)
-                                } else {
-                                    println!("cancel dashboard future appears canceled");
-                                    (false, ResultType::ABORTED)
+                                match res {
+                                    Ok(reply) => (reply.success, ResultType::CANCELED),
+                                    Err(_) => {
+                                        println!("cancel dashboard future appears canceled");
+                                        (false, ResultType::ABORTED)
+                                    }
                                 }
                             }
                             Either::Right(((res, _), _ds_cancel_receiver)) => {
-                                if let Ok(ok) = res {
-                                    println!("goal completed before cancel. result: {}", ok);
-                                    (ok, ResultType::SUCCEDED)
-                                } else {
-                                    println!("finished executing but future is canceled.");
-                                    (false, ResultType::ABORTED)
+                                // Same verdict mapping as the nominal path above.
+                                match res {
+                                    Ok(true) => {
+                                        println!("goal completed before cancel took effect.");
+                                        (true, ResultType::SUCCEDED)
+                                    }
+                                    Ok(false) => {
+                                        println!("goal ended without success before cancel.");
+                                        (false, ResultType::ABORTED)
+                                    }
+                                    Err(_) => {
+                                        println!("finished executing but future is canceled.");
+                                        (false, ResultType::ABORTED)
+                                    }
                                 }
                             }
                         }
@@ -122,25 +171,44 @@ pub async fn handle_request(
         };
 
     let request_state;
+    let result_message;
     match result_type {
         ResultType::ABORTED => {
             log::error!(target: &log_target, "Goal aborted, result is: '{}'.", result_success);
             request_state = ActionRequestState::Failed.to_string();
+            result_message = "aborted before reaching the goal".to_string();
         }
         ResultType::CANCELED => {
             log::warn!(target: &log_target, "Goal cancelled, result is: '{}'.", result_success);
             request_state = ActionRequestState::Succeeded.to_string();
+            result_message = "cancelled".to_string();
         }
         ResultType::SUCCEDED => {
             log::info!(target: &log_target, "Goal succeeded, result is: '{}'.", result_success);
             request_state = ActionRequestState::Succeeded.to_string();
+            result_message = "succeeded".to_string();
         }
     }
 
-    StateManager::set_sp_value(&mut con, &key("request_state"), &request_state.to_spvalue()).await;
+    if request_state == ActionRequestState::Succeeded.to_string() {
+        publish_script_result(&mut con, &robot_name, &result_message, true).await;
+        StateManager::set_sp_value(&mut con, &key("request_state"), &request_state.to_spvalue())
+            .await;
+        // A successful run clears the consecutive-failure streak. The total counter
+        // is cumulative and is never reset.
+        StateManager::set_sp_value(&mut con, &key("subsequent_fail_counter"), &0.to_spvalue())
+            .await;
+    } else {
+        // Route execution failures through the same helper as the admission-control
+        // rejections, so both kinds of failure land in `request_result` the same way
+        // and both move the counters. A supervisor watching
+        // `subsequent_fail_counter` wants a move that aborted on the robot to count
+        // just as much as one this driver refused to start.
+        fail_request(&mut con, &robot_name, &result_message, &log_target).await;
+    }
 
     {
-        let mut ds = driver_state.lock().unwrap();
+        let mut ds = lock_driver_state(&driver_state);
         ds.goal_id = None;
         ds.goal_sender = None;
         ds.handshake_sender = None;

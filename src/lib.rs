@@ -1,7 +1,7 @@
 // TODO: Measure these a few more times and take the average, RSP only weighed another time 0.83kg
 
 pub const UR_DRIVER_SOCKET_PORT: u16 = 50000;
-pub const ROBOT_STATE_UPDATE_INTERVAL_MS: u16 = 10;
+pub const ROBOT_STATE_UPDATE_INTERVAL_MS: u16 = 5;
 
 pub const RSP_ONLY_PAYLOAD: &str = "0.69,[0.026,-0.008,0.012],[0.0,0.0,0.0,0.0,0.0,0.0]";
 pub const RSP_AND_SPONGE_PAYLOAD: &str = "1.88,[0.002,0.003,0.071],[0.0,0.0,0.0,0.0,0.0,0.0]";
