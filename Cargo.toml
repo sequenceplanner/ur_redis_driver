@@ -24,8 +24,5 @@ serde_json = "1.0.127"
 roxmltree = "0.21.1"
 serde = { version = "1.0.217", features = ["derive"] }
 local-ip-address = "0.6"
-# No direct `redis` dependency: the Redis handle is `micro_sp::SPConnection`, so
-# the redis version and its feature set are micro_sp's to pick. Declaring redis
-# here again only risks drifting out of lockstep with it.
-micro_sp = { git = "ssh://git@github.com/endre90/micro_sp.git", branch = "master" }
+micro_sp = { git = "ssh://git@github.com/endre90/micro_sp.git", tag = "v0.5.0" }
 base64 = "0.22.1"
