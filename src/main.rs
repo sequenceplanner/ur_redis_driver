@@ -77,7 +77,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     params.description_file = urdf_path.clone();
     params.ur_meshes_path = ur_meshes_path;
 
-    let templates: tera::Tera = {
+    let templates: Arc<tera::Tera> = Arc::new({
         let tera = match tera::Tera::new(&format!("{}/*.script", templates_dir)) {
             Ok(t) => {
                 log::warn!(target: &log_target, "Looking for Tera templates...",);
@@ -89,7 +89,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         tera
-    };
+    });
 
     let template_names = templates
         .get_template_names()
@@ -131,7 +131,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         shared_state.clone(),
         &local_addr_receiver,
         tx_dashboard.clone(),
-        &templates,
+        templates.clone(),
     );
 
     let dashboard_command_server =

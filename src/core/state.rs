@@ -65,6 +65,10 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let gripper_velocity = fv!(&&format!("{}_gripper_velocity", robot_name));
     let gripper_ref_pos_percentage = iv!(&&format!("{}_gripper_ref_pos_percentage", robot_name));
     let waypoints = av!(&&format!("{}_waypoints", robot_name));
+    // Whether the trajectory templates report each waypoint they reach. Only a
+    // reported trajectory can resume mid-path; see `RobotCommand`.
+    let report_waypoint_progress =
+        bv!(&&format!("{}_report_waypoint_progress", robot_name));
 
     // Measured state, written by `state_publisher` from what `realtime_reader`
     // decodes off the RT stream. None of this used to leave the process.
@@ -80,6 +84,12 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let robot_connected = bv!(&&format!("{}_robot_connected", robot_name));
     let dashboard_connected = bv!(&&format!("{}_dashboard_connected", robot_name));
     let remote_control = bv!(&&format!("{}_remote_control", robot_name));
+    let operational_mode = v!(&&format!("{}_operational_mode", robot_name));
+    let motion_paused = bv!(&&format!("{}_motion_paused", robot_name));
+    // Read once per dashboard connection rather than polled.
+    let robot_model = v!(&&format!("{}_robot_model", robot_name));
+    let serial_number = v!(&&format!("{}_serial_number", robot_name));
+    let polyscope_version = v!(&&format!("{}_polyscope_version", robot_name));
 
     let state = state.add(assign!(command_type, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(acceleration, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
@@ -112,6 +122,8 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let state = state.add(assign!(gripper_velocity, SPValue::Float64(FloatOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(gripper_ref_pos_percentage, SPValue::Int64(IntOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(waypoints, SPValue::Array(ArrayOrUnknown::UNKNOWN)), &log_target);
+    // Seeded true, matching the default `command_server` falls back to.
+    let state = state.add(assign!(report_waypoint_progress, true.to_spvalue()), &log_target);
 
     let state = state.add(assign!(safety_mode, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(robot_mode, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
@@ -125,6 +137,11 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let state = state.add(assign!(robot_connected, false.to_spvalue()), &log_target);
     let state = state.add(assign!(dashboard_connected, false.to_spvalue()), &log_target);
     let state = state.add(assign!(remote_control, false.to_spvalue()), &log_target);
+    let state = state.add(assign!(operational_mode, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(motion_paused, false.to_spvalue()), &log_target);
+    let state = state.add(assign!(robot_model, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(serial_number, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
+    let state = state.add(assign!(polyscope_version, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
 
     state
 }

@@ -4,170 +4,17 @@ use tokio::sync::{mpsc, oneshot};
 use micro_sp::*;
 use serde::{Deserialize, Serialize};
 
-/// Everything the driver can ask the UR Dashboard Server (port 29999) to do.
-///
-/// Variants carrying a `String` take their argument from
-/// `{robot}_dashboard_command_arg`. Query variants (`expect() == None`) return the
-/// controller's raw reply as the payload of `DashboardReply`.
-#[derive(Clone, PartialEq, Debug)]
-pub enum DashboardCommand {
-    // Program control
-    Stop,
-    Pause,
-    Play,
-    // Power
-    PowerOn,
-    PowerOff,
-    BrakeRelease,
-    // Safety recovery
-    UnlockProtectiveStop,
-    CloseSafetyPopup,
-    ClosePopup,
-    RestartSafety,
-    // Program / installation
-    Load(String),
-    LoadInstallation(String),
-    // Queries
-    RobotMode,
-    SafetyStatus,
-    ProgramState,
-    IsProgramRunning,
-    IsInRemoteControl,
-    GetLoadedProgram,
-    GetRobotModel,
-    PolyscopeVersion,
-    // Misc
-    Popup(String),
-    AddToLog(String),
-    Shutdown,
-}
+use crate::core::dashboard_types::{DashboardIdentity, RobotMode, SafetyMode};
 
-/// The outcome of one dashboard command.
-///
-/// `response` is the controller's reply line, verbatim and trimmed. For a query
-/// that line *is* the answer; for an action it is kept so a failure can say what
-/// the controller actually said instead of just `false`.
-#[derive(Clone, Debug)]
-pub struct DashboardReply {
-    pub success: bool,
-    pub response: String,
-}
 
-impl DashboardReply {
-    pub fn ok(response: impl Into<String>) -> Self {
-        DashboardReply { success: true, response: response.into() }
-    }
-
-    pub fn fail(response: impl Into<String>) -> Self {
-        DashboardReply { success: false, response: response.into() }
-    }
-}
-
-impl DashboardCommand {
-    /// Map the string written to `{robot}_dashboard_command` onto a command.
-    ///
-    /// `arg` comes from `{robot}_dashboard_command_arg` and is ignored by the
-    /// variants that do not take one.
-    pub fn parse(name: &str, arg: &str) -> Option<Self> {
-        let cmd = match name.trim().to_lowercase().as_str() {
-            "stop" => DashboardCommand::Stop,
-            "pause" => DashboardCommand::Pause,
-            "play" => DashboardCommand::Play,
-            "power_on" => DashboardCommand::PowerOn,
-            "power_off" => DashboardCommand::PowerOff,
-            "brake_release" => DashboardCommand::BrakeRelease,
-            // `reset_protective_stop` is the name the old enum used; keep it as an
-            // alias so anything already written against it keeps working.
-            "unlock_protective_stop" | "reset_protective_stop" => {
-                DashboardCommand::UnlockProtectiveStop
-            }
-            "close_safety_popup" => DashboardCommand::CloseSafetyPopup,
-            "close_popup" => DashboardCommand::ClosePopup,
-            "restart_safety" => DashboardCommand::RestartSafety,
-            "load" => DashboardCommand::Load(arg.to_string()),
-            "load_installation" => DashboardCommand::LoadInstallation(arg.to_string()),
-            "robot_mode" => DashboardCommand::RobotMode,
-            "safety_status" => DashboardCommand::SafetyStatus,
-            "program_state" => DashboardCommand::ProgramState,
-            "is_program_running" => DashboardCommand::IsProgramRunning,
-            "is_in_remote_control" => DashboardCommand::IsInRemoteControl,
-            "get_loaded_program" => DashboardCommand::GetLoadedProgram,
-            "get_robot_model" => DashboardCommand::GetRobotModel,
-            "polyscope_version" => DashboardCommand::PolyscopeVersion,
-            "popup" => DashboardCommand::Popup(arg.to_string()),
-            "add_to_log" => DashboardCommand::AddToLog(arg.to_string()),
-            "shutdown" => DashboardCommand::Shutdown,
-            _ => return None,
-        };
-        Some(cmd)
-    }
-
-    /// The line to write on the socket, without the trailing newline.
-    pub fn wire(&self) -> String {
-        match self {
-            DashboardCommand::Stop => "stop".to_string(),
-            DashboardCommand::Pause => "pause".to_string(),
-            DashboardCommand::Play => "play".to_string(),
-            DashboardCommand::PowerOn => "power on".to_string(),
-            DashboardCommand::PowerOff => "power off".to_string(),
-            DashboardCommand::BrakeRelease => "brake release".to_string(),
-            DashboardCommand::UnlockProtectiveStop => "unlock protective stop".to_string(),
-            DashboardCommand::CloseSafetyPopup => "close safety popup".to_string(),
-            DashboardCommand::ClosePopup => "close popup".to_string(),
-            DashboardCommand::RestartSafety => "restart safety".to_string(),
-            DashboardCommand::Load(p) => format!("load {}", p),
-            DashboardCommand::LoadInstallation(p) => format!("load installation {}", p),
-            DashboardCommand::RobotMode => "robotmode".to_string(),
-            DashboardCommand::SafetyStatus => "safetystatus".to_string(),
-            DashboardCommand::ProgramState => "programState".to_string(),
-            DashboardCommand::IsProgramRunning => "running".to_string(),
-            DashboardCommand::IsInRemoteControl => "is in remote control".to_string(),
-            DashboardCommand::GetLoadedProgram => "get loaded program".to_string(),
-            DashboardCommand::GetRobotModel => "get robot model".to_string(),
-            DashboardCommand::PolyscopeVersion => "PolyscopeVersion".to_string(),
-            DashboardCommand::Popup(t) => format!("popup {}", t),
-            DashboardCommand::AddToLog(t) => format!("addToLog {}", t),
-            DashboardCommand::Shutdown => "shutdown".to_string(),
-        }
-    }
-
-    /// Substring of the reply that means the command took effect.
-    ///
-    /// `None` marks a query: there is no fixed reply to match, so any reply at all
-    /// is a success and the reply itself is the answer.
-    pub fn expect(&self) -> Option<&'static str> {
-        match self {
-            DashboardCommand::Stop => Some("Stopped"),
-            DashboardCommand::Pause => Some("Pausing program"),
-            DashboardCommand::Play => Some("Starting program"),
-            DashboardCommand::PowerOn => Some("Powering on"),
-            DashboardCommand::PowerOff => Some("Powering off"),
-            DashboardCommand::BrakeRelease => Some("Brake releasing"),
-            DashboardCommand::UnlockProtectiveStop => Some("Protective stop releasing"),
-            DashboardCommand::CloseSafetyPopup => Some("closing safety popup"),
-            DashboardCommand::ClosePopup => Some("closing popup"),
-            DashboardCommand::RestartSafety => Some("Restarting safety"),
-            DashboardCommand::Load(_) => Some("Loading program"),
-            DashboardCommand::LoadInstallation(_) => Some("Loading installation"),
-            DashboardCommand::Popup(_) => Some("showing popup"),
-            DashboardCommand::AddToLog(_) => Some("Added log message"),
-            DashboardCommand::Shutdown => Some("Shutting down"),
-            // Queries - the reply is the payload, there is nothing to match.
-            DashboardCommand::RobotMode
-            | DashboardCommand::SafetyStatus
-            | DashboardCommand::ProgramState
-            | DashboardCommand::IsProgramRunning
-            | DashboardCommand::IsInRemoteControl
-            | DashboardCommand::GetLoadedProgram
-            | DashboardCommand::GetRobotModel
-            | DashboardCommand::PolyscopeVersion => None,
-        }
-    }
-}
-
+/// One accepted motion goal, as handed to `handle_request`.
 pub struct ScriptRequest {
     pub uuid: String,
+    /// The rendered script, ready to write to port 30003.
     pub script: String,
+    /// The command it was rendered from, retained so a resume can re-render the
+    /// remainder of the motion instead of replaying it from the start.
+    pub command: RobotCommand,
 }
 
 pub struct DriverState {
@@ -204,6 +51,10 @@ pub struct DriverState {
     pub program_state: String,
     /// Whether the controller reports a program as running. Dashboard-sourced.
     pub program_running: bool,
+    /// PolyScope operational mode as the dashboard reports it: "MANUAL",
+    /// "AUTOMATIC", or "NONE" when no mode password is set. Dashboard-sourced;
+    /// the realtime stream does not carry it.
+    pub operational_mode: String,
     pub joint_values: Vec<f64>,
     pub joint_speeds: Vec<f64>,
     /// Actual TCP pose as [x, y, z, rx, ry, rz], RT packet offset 444.
@@ -214,6 +65,32 @@ pub struct DriverState {
     pub digital_outputs: u32,
     pub forces: Vec<f64>,
     pub cancel_sender: Option<mpsc::Sender<()>>,
+    /// The robot is being held by a dashboard `pause`.
+    ///
+    /// Set by the dashboard task once the controller confirms `PAUSED`, cleared on
+    /// resume and on goal teardown. While it is true `command_server` rejects new
+    /// motion requests: accepting a move on a robot an operator has deliberately
+    /// held would be a surprise.
+    pub motion_paused: bool,
+    /// The command behind the live goal, retained so a resume can re-render it.
+    pub active_command: Option<RobotCommand>,
+    /// How many trajectory waypoints the running script has reported reaching.
+    ///
+    /// Fed by the `waypoint_reached <n>` lines the trajectory templates send on the
+    /// script socket. A resume drops this many waypoints so the robot continues
+    /// forward instead of driving back through the path it already covered.
+    pub waypoints_completed: usize,
+    /// A goal is between the script that was paused and the one that will finish it.
+    ///
+    /// `socket_server` clears `goal_id` as soon as the killed script's socket
+    /// closes, which would otherwise leave a window where admission control sees no
+    /// live goal and lets a new request in on top of the resume.
+    pub reissuing: bool,
+    /// Mirrors `cancel_sender`: signals the live goal to re-issue itself, which is
+    /// the fallback when a dashboard `play` does not resume an injected script.
+    pub resume_sender: Option<mpsc::Sender<()>>,
+    /// Fixed controller facts, read once per dashboard connection.
+    pub identity: Option<DashboardIdentity>,
 }
 
 impl DriverState {
@@ -232,6 +109,7 @@ impl DriverState {
             program_state_raw: 0,
             program_state: "UNKNOWN".to_string(),
             program_running: false,
+            operational_mode: "UNKNOWN".to_string(),
             joint_values: vec![],
             joint_speeds: vec![],
             tcp_pose: vec![],
@@ -240,6 +118,12 @@ impl DriverState {
             digital_outputs: 0,
             forces: vec![],
             cancel_sender: None,
+            motion_paused: false,
+            active_command: None,
+            waypoints_completed: 0,
+            reissuing: false,
+            resume_sender: None,
+            identity: None,
         }
     }
 }
@@ -257,51 +141,31 @@ pub fn lock_driver_state(driver_state: &Mutex<DriverState>) -> MutexGuard<'_, Dr
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// UR safety mode (RT packet offset 812).
+/// UR safety mode (RT packet offset 812), as a name.
+///
+/// A thin wrapper over [`SafetyMode`], which is the type to reach for in new code.
+/// This exists because the driver stores safety mode as the raw `i32` off the
+/// realtime packet and several call sites only want it spelled out.
 pub fn safety_mode_name(mode: i32) -> &'static str {
-    match mode {
-        1 => "NORMAL",
-        2 => "REDUCED",
-        3 => "PROTECTIVE_STOP",
-        4 => "RECOVERY",
-        5 => "SAFEGUARD_STOP",
-        6 => "SYSTEM_EMERGENCY_STOP",
-        7 => "ROBOT_EMERGENCY_STOP",
-        8 => "VIOLATION",
-        9 => "FAULT",
-        _ => "UNKNOWN",
-    }
+    SafetyMode::from_rt(mode).as_str()
 }
 
-/// UR robot mode (RT packet offset 756).
+/// UR robot mode (RT packet offset 756), as a name. See `safety_mode_name`.
 pub fn robot_mode_name(mode: i32) -> &'static str {
-    match mode {
-        -1 => "NO_CONTROLLER",
-        0 => "DISCONNECTED",
-        1 => "CONFIRM_SAFETY",
-        2 => "BOOTING",
-        3 => "POWER_OFF",
-        4 => "POWER_ON",
-        5 => "IDLE",
-        6 => "BACKDRIVE",
-        7 => "RUNNING",
-        8 => "UPDATING_FIRMWARE",
-        _ => "UNKNOWN",
-    }
+    RobotMode::from_rt(mode).as_str()
 }
 
 /// Safety modes in which an in-flight goal can no longer complete.
 ///
 /// Deliberately excludes `2 == REDUCED`, which is a normal operating mode: the
-/// robot slows down inside a reduced-speed zone but keeps running. The previous
-/// `safety_mode != 1` test aborted every goal that entered such a zone.
+/// robot slows down inside a reduced-speed zone but keeps running.
 pub fn safety_mode_aborts_goal(mode: i32) -> bool {
-    matches!(mode, 3 | 5 | 6 | 7 | 8 | 9)
+    SafetyMode::from_rt(mode).aborts_goal()
 }
 
 /// Safety modes in which a new motion request may be accepted.
 pub fn safety_mode_accepts_goal(mode: i32) -> bool {
-    matches!(mode, 1 | 2)
+    SafetyMode::from_rt(mode).accepts_goal()
 }
 
 // This is to be sent out in the orbot command
@@ -406,6 +270,12 @@ pub struct RobotCommand {
     pub relative_pose: Vec<f64>, // use pose_to_string, relative to current TCP pose
     pub tcp_in_faceplate: String, // use pose_to_string
     pub force_threshold: f64,
+    // Whether the trajectory templates should report each waypoint they reach on
+    // the script socket. Progress is what lets a paused blended trajectory resume
+    // where it stopped, but the socket write sits between two blended moves and may
+    // flush the controller's look-ahead buffer, breaking the blend. Off means a
+    // guaranteed-smooth blend and no mid-trajectory resume.
+    pub report_waypoint_progress: bool,
     pub waypoints: Vec<Waypoint>
     // pub gripper_velocity: f64,
     // pub gripper_force: f64,

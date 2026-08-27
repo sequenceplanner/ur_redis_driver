@@ -8,6 +8,11 @@ use tokio_util::codec::{Framed, LinesCodec};
 
 use crate::{DriverState, UR_DRIVER_SOCKET_PORT, lock_driver_state};
 
+/// Prefix of the progress lines the trajectory templates send.
+///
+/// Must match `templates/trajectory_*.script`.
+const WAYPOINT_REACHED_PREFIX: &str = "waypoint_reached ";
+
 pub async fn socket_server(
     driver_state: Arc<Mutex<DriverState>>,
     mut local_addr: watch::Receiver<Option<SocketAddr>>,
@@ -84,6 +89,25 @@ pub async fn socket_server(
                     let mut ds = lock_driver_state(&driver_state);
                     if let Some(goal_sender) = ds.goal_sender.take() {
                         let _ = goal_sender.send(false);
+                    }
+                }
+                // Trajectory progress, not feedback. The templates emit one of
+                // these per waypoint so a paused blended trajectory can resume
+                // where it stopped instead of driving back through the path it
+                // already covered. With blending the line fires as the controller
+                // hands over to the next move rather than at a full stop, which is
+                // exactly the boundary a resume wants.
+                Some(Ok(s)) if s.starts_with(WAYPOINT_REACHED_PREFIX) => {
+                    let index = s[WAYPOINT_REACHED_PREFIX.len()..].trim().parse::<usize>();
+                    match index {
+                        Ok(index) => {
+                            // The script reports the index it reached, so the count
+                            // of finished waypoints is one higher.
+                            lock_driver_state(&driver_state).waypoints_completed = index + 1;
+                        }
+                        Err(_) => {
+                            println!("could not read a waypoint index out of '{}'", s);
+                        }
                     }
                 }
                 Some(Ok(s)) => {

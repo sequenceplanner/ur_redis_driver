@@ -3,7 +3,10 @@ use k::{Isometry3, Vector3};
 // use micro_sp::management::transforms;
 use micro_sp::*;
 use ordered_float::OrderedFloat;
-use crate::{DriverState, URDFParameters, lock_driver_state, robot_mode_name, safety_mode_name};
+use crate::{
+    DashboardIdentity, DriverState, URDFParameters, lock_driver_state, robot_mode_name,
+    safety_mode_name,
+};
 use roxmltree::Document;
 use std::collections::HashMap;
 use std::fs;
@@ -73,6 +76,9 @@ pub async fn state_publisher(
                     robot_connected: ds.connected,
                     dashboard_connected: ds.dashboard_connected,
                     remote_control: ds.remote_control,
+                    operational_mode: ds.operational_mode.clone(),
+                    motion_paused: ds.motion_paused,
+                    identity: ds.identity.clone(),
                 },
             )
         };
@@ -413,6 +419,11 @@ struct MeasuredState {
     robot_connected: bool,
     dashboard_connected: bool,
     remote_control: bool,
+    operational_mode: String,
+    motion_paused: bool,
+    /// Model, serial and PolyScope version, read once per dashboard connection.
+    /// `None` while the dashboard socket is down.
+    identity: Option<DashboardIdentity>,
 }
 
 /// Force change, in newtons, that counts as news.
@@ -449,6 +460,9 @@ impl MeasuredState {
             || self.robot_connected != previous.robot_connected
             || self.dashboard_connected != previous.dashboard_connected
             || self.remote_control != previous.remote_control
+            || self.operational_mode != previous.operational_mode
+            || self.motion_paused != previous.motion_paused
+            || self.identity != previous.identity
         {
             return true;
         }
@@ -554,6 +568,31 @@ async fn publish_measured_state(robot_id: &str, measured: &MeasuredState, con: &
     );
     let state = state.add(
         assign!(bv!(&&key("remote_control")), measured.remote_control.to_spvalue()),
+        &log_target,
+    );
+    let state = state.add(
+        assign!(v!(&&key("operational_mode")), measured.operational_mode.to_spvalue()),
+        &log_target,
+    );
+    let state = state.add(
+        assign!(bv!(&&key("motion_paused")), measured.motion_paused.to_spvalue()),
+        &log_target,
+    );
+
+    // Blank rather than stale while the dashboard socket is down: these describe the
+    // controller this driver is currently talking to, and a leftover serial number
+    // from the last one would be worse than no answer.
+    let identity = measured.identity.clone().unwrap_or_default();
+    let state = state.add(
+        assign!(v!(&&key("robot_model")), identity.robot_model.to_spvalue()),
+        &log_target,
+    );
+    let state = state.add(
+        assign!(v!(&&key("serial_number")), identity.serial_number.to_spvalue()),
+        &log_target,
+    );
+    let state = state.add(
+        assign!(v!(&&key("polyscope_version")), identity.polyscope_version.to_spvalue()),
         &log_target,
     );
 

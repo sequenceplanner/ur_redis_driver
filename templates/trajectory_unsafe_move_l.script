@@ -42,6 +42,9 @@ def script():
   , r={{ wp.blend_radius }}
   {%- endif -%})
   {%- endif %}
+  {%- if report_waypoint_progress %}
+  socket_send_line("waypoint_reached {{ loop.index0 }}", "ur_driver_socket")
+  {%- endif %}
   {%- endfor %}
   
   return True

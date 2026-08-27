@@ -11,6 +11,7 @@ pub const RSP_AND_SVT_PAYLOAD: &str = "1.3,[0.001,0.005,0.06],[0.0,0.0,0.0,0.0,0
 pub const RSP_AND_PHOTONEO_PAYLOAD: &str = "3.29,[0.008,0.003,0.082],[0.0,0.0,0.0,0.0,0.0,0.0]";
 
 pub mod core;
+pub use core::dashboard_types::*;
 pub use core::state::*;
 pub use core::structs::*;
 

@@ -14,9 +14,15 @@ use crate::{DashboardCommand, DashboardReply, state_bool_or, state_string_or};
 /// round trip once triggered.
 const DASHBOARD_POLL_INTERVAL_MS: u64 = 50;
 
-/// Ceiling on one dashboard command, including the reconnect the dashboard task
-/// may do underneath. Longer than any individual step in `reset_protective_stop`.
-const DASHBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Slack added to a command's own reply timeout to get the ceiling on the whole
+/// round trip.
+///
+/// The command's `reply_timeout()` bounds the controller's answer; this covers the
+/// queueing and the reconnect the dashboard task may do underneath. A single flat
+/// ceiling cannot work here - `load` alone is allowed 30 s and `generate support
+/// file` ten minutes, while a `robotmode` query that takes five seconds means the
+/// controller is gone.
+const DASHBOARD_COMMAND_SLACK: Duration = Duration::from_secs(3);
 
 /// Redis-facing half of the dashboard interface.
 ///
@@ -100,17 +106,18 @@ pub async fn dashboard_server(
         let command_arg =
             state_string_or(&state, &key("dashboard_command_arg"), "", &log_target);
 
-        let Some(command) = DashboardCommand::parse(&command_name, &command_arg) else {
-            log::error!(target: &log_target, "Unknown dashboard command: '{}'.", command_name);
-            finish(
-                &mut con,
-                robot_name,
-                false,
-                &format!("unknown dashboard command '{}'", command_name),
-            )
-            .await;
-            continue;
+        // `parse` reports a bad argument separately from an unknown name, so both
+        // land in `dashboard_request_result` as something a caller can act on.
+        let command = match DashboardCommand::parse(&command_name, &command_arg) {
+            Ok(command) => command,
+            Err(reason) => {
+                log::error!(target: &log_target, "Rejecting dashboard request: {}.", reason);
+                finish(&mut con, robot_name, false, &reason).await;
+                continue;
+            }
         };
+
+        let command_timeout = command.reply_timeout() + DASHBOARD_COMMAND_SLACK;
 
         StateManager::set_sp_value(
             &mut con,
@@ -131,10 +138,13 @@ pub async fn dashboard_server(
             continue;
         }
 
-        let (success, response) = match timeout(DASHBOARD_COMMAND_TIMEOUT, reply_receiver).await {
+        let (success, response) = match timeout(command_timeout, reply_receiver).await {
             Ok(Ok(reply)) => (reply.success, reply.response),
             Ok(Err(_)) => (false, "dashboard task dropped the request".to_string()),
-            Err(_) => (false, "timed out waiting for the controller".to_string()),
+            Err(_) => (
+                false,
+                format!("timed out waiting for the controller after {:?}", command_timeout),
+            ),
         };
 
         log::info!(

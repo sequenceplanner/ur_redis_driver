@@ -79,6 +79,7 @@ dashboard `stop`.
 | `r1_tcp_id` | string | TCP frame; looked up against `faceplate_id` |
 | `r1_force_threshold` | float | Force guard for the `safe_*` templates |
 | `r1_waypoints` | array of maps | Blended trajectory, see below |
+| `r1_report_waypoint_progress` | bool | Default true. Trajectory templates report each waypoint reached, so a paused trajectory can resume mid-path. See Pause and resume |
 | `r1_request_feedback` | string | Latest line the running script sent back |
 | `r1_total_fail_counter` | int | Cumulative failures, never reset |
 | `r1_subsequent_fail_counter` | int | Consecutive failures, reset to 0 on success |
@@ -113,24 +114,73 @@ r1_dashboard_request_result   the controller's reply
 
 | Command | Arg | Notes |
 |---|---|---|
-| `stop`, `pause`, `play` | | See the caveat below |
+| `stop` | | Kills the running script. This is what cancellation uses |
+| `pause`, `resume` | | Holds and releases robot motion, see below |
+| `play` | | The bare `play` primitive, with no confirmation and no fallback |
 | `power_on`, `power_off`, `brake_release` | | |
 | `unlock_protective_stop` | | Closes the safety popup, waits out the settle, unlocks, then confirms against the realtime safety mode. Alias: `reset_protective_stop` |
-| `close_safety_popup`, `close_popup`, `restart_safety` | | |
-| `load`, `load_installation` | filename | |
+| `close_safety_popup`, `close_popup`, `restart_safety` | | `restart_safety` leaves the robot in Power Off; follow it with `power_on` and `brake_release` |
+| `load`, `load_installation` | filename | Allowed 30 s: the controller does not answer until the program *and* its installation have loaded |
+| `set_operational_mode` | `manual` \| `automatic` | While set, the mode cannot be changed from PolyScope and the user password is disabled |
+| `get_operational_mode` | | `MANUAL`, `AUTOMATIC`, or `NONE` when no mode password is set |
+| `clear_operational_mode` | | Hands the mode back to PolyScope |
 | `popup`, `add_to_log` | text | |
 | `shutdown` | | Powers down the controller |
-| `safety_status`, `robot_mode`, `program_state`, `is_program_running`, `is_in_remote_control`, `get_loaded_program`, `get_robot_model`, `polyscope_version` | | Queries; the reply lands in `r1_dashboard_request_result` |
+| `generate_flight_report` | `controller` \| `software` \| `system` | Allowed 5 min. Defaults to `system`. UR requires 30 s between reports |
+| `generate_support_file` | directory | Allowed 10 min. See the caveat under Known gaps |
+| `safety_status`, `safety_mode`, `robot_mode`, `program_state`, `is_program_running`, `is_program_saved`, `is_in_remote_control`, `get_loaded_program`, `get_robot_model`, `get_serial_number`, `polyscope_version`, `version` | | Queries; the reply lands in `r1_dashboard_request_result` |
+
+`quit` is deliberately not exposed - it would close the socket this driver keeps
+open for the life of the process. `safety_mode` is UR-deprecated in favour of
+`safety_status`, and is kept because it is the query that cross-checks realtime
+offset 812. `version` needs PolyScope 5.13 or later.
+
+Each command carries its own reply timeout (`DashboardCommand::reply_timeout`)
+rather than sharing one ceiling, and a bad or missing argument is reported in
+`r1_dashboard_request_result` rather than as an unknown command.
 
 Most action commands require the robot to be in **Remote Control**. In Local mode
 the controller answers `Failed to execute: <command>` and the request fails with
-that text.
+that text, plus ` (robot is in Local control)` when that is why.
 
-**Pause/play caveat.** This driver injects scripts over port 30003 rather than
-loading a `.urp`, so `play` does not resume an injected script that `pause`
-suspended — it tries to start the *loaded pendant program*. `stop` does reliably
-kill an injected script. Treat `pause` as a hold you release with `stop` followed
-by re-issuing the motion request.
+## Pause and resume
+
+`pause` holds the robot where it is and `resume` releases it:
+
+```
+r1_dashboard_command = "pause"    # robot decelerates and holds
+r1_motion_paused                  # goes true
+r1_dashboard_command = "resume"   # robot continues to its goal
+```
+
+While `r1_motion_paused` is true, a new motion request is rejected with `motion is
+paused` - accepting a move into a hold an operator put on deliberately would resume
+the wrong goal. The flag is cleared by `resume` and by the goal reaching a terminal
+state, so it cannot outlive the motion it was holding.
+
+**How resume works, and why it has two paths.** This driver injects scripts over
+port 30003 rather than loading a `.urp`. Dashboard `pause` does hold such a script,
+but `play` starts the *loaded pendant program*, so it may not resume an injected
+one. `resume` therefore issues `play`, waits up to 500 ms for a program to actually
+be running, and if none is, tells the live goal to re-issue itself: the remainder of
+the motion is re-rendered and sent as a second script under the **same goal id and
+the same Redis request**. Either way the original request walks to `succeeded`.
+Which path ran is reported in `r1_dashboard_request_result` - `resumed`, or
+`play did not resume, re-issuing the goal`.
+
+Two motions cannot be resumed by re-issue, and say so instead of moving wrongly:
+
+- **`*_relative` commands.** The offset is applied to the TCP pose at the moment the
+  script runs, so a re-issue from the paused pose would travel the full offset a
+  second time. Cancel and submit a new request.
+- **A trajectory whose waypoints were all reached.** Nothing is left to run.
+
+For a blended trajectory, resume drops the waypoints already reached so the robot
+continues forward instead of driving back through the path it covered. That needs
+the script to report progress, which is what `r1_report_waypoint_progress` (default
+true) turns on. The reporting line sits between two blended moves and may flush the
+controller's look-ahead buffer; set the key false to give up mid-trajectory resume
+in exchange for a guaranteed-smooth blend.
 
 ## Published state
 
@@ -150,6 +200,9 @@ unchanged values.
 | `r1_program_state` | string | **Dashboard**, `programState` |
 | `r1_program_running` | bool | **Dashboard**, `running` |
 | `r1_remote_control` | bool | **Dashboard**, refreshed every 2 s |
+| `r1_operational_mode` | string | **Dashboard**, `MANUAL`, `AUTOMATIC` or `NONE` |
+| `r1_motion_paused` | bool | True between a `pause` and its `resume` |
+| `r1_robot_model` / `r1_serial_number` / `r1_polyscope_version` | string | **Dashboard**, read once per connection, cleared when it drops |
 | `r1_robot_connected` / `r1_dashboard_connected` | bool | Socket liveness |
 
 TF frames go to `tf:<child_frame_id>`: `base_link_inertia`, `shoulder_link`,
@@ -185,7 +238,15 @@ driver's own scripts.
 - Realtime parsing uses fixed offsets and requires a 1220-byte frame, so it is tied
   to this PolyScope generation. RTDE (port 30004) would be version-independent and
   would also allow *writing* speed scaling and digital outputs.
-- No tests.
+- The dashboard task serves one socket serially, so a long command holds up
+  everything else on it. `generate_support_file` can take ten minutes, and for that
+  long the keepalive does not run and `pause` / `resume` cannot get through. Use the
+  long diagnostic commands when the robot is idle.
+- Only the two `trajectory_*` templates report waypoint progress, so only they can
+  resume mid-path. A single move resumes by being re-sent, which is correct because
+  its target is absolute in the base frame.
+- Tests cover the dashboard command/reply model and template rendering
+  (`tests/smoke.rs`). Nothing else is tested, and nothing exercises a robot.
 - The gripper interface (`generate_gripper_interface_state`) is written but not
   wired up.
 - Digital outputs cannot be set from Redis.

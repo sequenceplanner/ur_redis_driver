@@ -26,7 +26,10 @@ pub async fn command_server(
     driver_state: Arc<Mutex<DriverState>>,
     local_addr: &watch::Receiver<Option<SocketAddr>>,
     dashboard_commands: mpsc::Sender<(DashboardCommand, oneshot::Sender<DashboardReply>)>,
-    templates: &tera::Tera,
+    // `Arc` rather than a reference: `handle_request` needs its own handle to
+    // re-render the remainder of a motion when a paused goal resumes, and it runs
+    // as a spawned task, so it cannot borrow.
+    templates: Arc<tera::Tera>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let log_target = format!("{robot_name}_action_client");
 
@@ -71,6 +74,7 @@ pub async fn command_server(
         "use_relative_pose",
         "relative_pose",
         "force_feedback",
+        "report_waypoint_progress",
         "waypoints",
     ];
 
@@ -244,6 +248,15 @@ pub async fn command_server(
                 );
                 let use_relative_pose =
                     state.get_bool_or_default_to_false(&key("use_relative_pose"), &log_target);
+                // Defaults to true: a trajectory that can be resumed where it
+                // stopped is the more useful default, and the flag exists to turn
+                // the reporting off if the socket write turns out to break blending
+                // on this controller.
+                let report_waypoint_progress = state.get_bool_or_value(
+                    &key("report_waypoint_progress"),
+                    true,
+                    &log_target,
+                );
 
                 let extract_f64_array = |state_key: &str, default_arr: &[f64]| -> Vec<f64> {
                     if let Some(micro_sp::SPValue::Array(ArrayOrUnknown::Array(values))) =
@@ -454,11 +467,15 @@ pub async fn command_server(
                     tcp_in_faceplate,
                     force_threshold,
                     relative_pose,
+                    report_waypoint_progress,
                     waypoints,
                 };
 
-                let script =
-                    match generate_core_script_from_template(robot_name, robot_command, templates) {
+                let script = match generate_core_script_from_template(
+                    robot_name,
+                    robot_command.clone(),
+                    &templates,
+                ) {
                         Ok(script) => script,
                         Err(e) => {
                             fail_request(
@@ -484,12 +501,21 @@ pub async fn command_server(
                     let ds = lock_driver_state(&driver_state);
                     if local_addr.is_none() || !ds.connected {
                         Some("not connected to the robot".to_string())
+                    } else if ds.motion_paused {
+                        // An operator has deliberately held the robot. Starting a
+                        // new move into that hold would be a surprise, and `resume`
+                        // would then resume the wrong goal.
+                        Some("motion is paused".to_string())
                     } else if !safety_mode_accepts_goal(ds.safety_mode) {
                         Some(format!(
                             "robot safety mode is {}",
                             safety_mode_name(ds.safety_mode)
                         ))
-                    } else if ds.goal_id.is_some() {
+                    } else if ds.goal_id.is_some() || ds.reissuing {
+                        // `reissuing` covers the gap between a paused script being
+                        // killed and its replacement being accepted, during which
+                        // `goal_id` is momentarily clear but the goal is very much
+                        // still live.
                         Some("a goal is already running".to_string())
                     } else {
                         None
@@ -516,10 +542,21 @@ pub async fn command_server(
 
                 // Note: If you want cancellation, you must hook `cancel_sender` up to your custom interface.
                 let (cancel_sender, cancel_receiver) = mpsc::channel(1);
+                // Signalled by the dashboard task when a `play` fails to resume the
+                // injected script. Kept in `DriverState` for the life of the goal
+                // rather than taken, because a goal can be paused and resumed more
+                // than once.
+                let (resume_sender, resume_receiver) = mpsc::channel(1);
 
-                lock_driver_state(&driver_state).cancel_sender = Some(cancel_sender);
+                {
+                    let mut ds = lock_driver_state(&driver_state);
+                    ds.cancel_sender = Some(cancel_sender);
+                    ds.resume_sender = Some(resume_sender);
+                    ds.active_command = Some(robot_command.clone());
+                    ds.waypoints_completed = 0;
+                }
 
-                let req = ScriptRequest { uuid, script };
+                let req = ScriptRequest { uuid, script, command: robot_command };
 
                 let task_ur_address = ur_address.to_string().clone();
                 let task_dashboard_commands = dashboard_commands.clone();
@@ -527,6 +564,7 @@ pub async fn command_server(
 
                 let con_clone = con.clone();
                 let robot_name_clone = robot_name.to_string().clone();
+                let task_templates = templates.clone();
                 local_pool.spawn_pinned(move || async {
                     let result = handle_request(
                         task_ur_address,
@@ -536,6 +574,8 @@ pub async fn command_server(
                         task_dashboard_commands,
                         req,
                         cancel_receiver,
+                        resume_receiver,
+                        task_templates,
                         con_clone,
                     )
                     .await;
