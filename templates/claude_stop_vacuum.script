@@ -1,0 +1,21 @@
+# claude_stop_vacuum
+#
+# Releases the vacuum. See claude_start_vacuum.script for the digital-output
+# conflict this template exists to fix.
+#
+# Optional parameters:
+#   vacuum_pin    (0)   - standard digital output the ejector sits on.
+#   blow_off_time (0.0) - seconds to hold a blow-off pulse after releasing. Set
+#                         it and blow_off_pin to shake a light part off the cup.
+#   blow_off_pin  (2)
+
+def script():
+  set_standard_digital_out({{ vacuum_pin | default(value=0) }}, False)
+  {%- if blow_off_time | default(value=0.0) > 0.0 %}
+  set_standard_digital_out({{ blow_off_pin | default(value=2) }}, True)
+  sleep({{ blow_off_time | default(value=0.0) }})
+  set_standard_digital_out({{ blow_off_pin | default(value=2) }}, False)
+  {%- endif %}
+  socket_send_line("vacuum off (standard DO {{ vacuum_pin | default(value=0) }})", "ur_driver_socket")
+  return True
+end

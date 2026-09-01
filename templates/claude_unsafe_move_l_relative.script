@@ -1,0 +1,68 @@
+# claude_unsafe_move_l_relative
+#
+# movel by an offset expressed in the *current TCP* frame. Unguarded.
+#
+# Fixes over unsafe_move_l_relative.script:
+#   * global_velocity_scaling / global_acceleration_scaling are applied.
+#   * set_tcp() is issued before get_forward_kin() is evaluated, so the offset is
+#     applied to the tool the caller asked for. In the original the TCP was set
+#     first as well, but the relative pose was composed with get_forward_kin()
+#     with no argument, which is correct - this version keeps that and documents
+#     it, because it is the one thing about this template that is easy to break.
+#   * The resulting pose is checked for reachability before moving.
+#
+# Note for the driver: this command type is deliberately refused by
+# handle_request::remaining_command on a resume - re-issuing it from the paused
+# pose would travel the offset a second time. Keep the "_relative" suffix on any
+# copy of this template or that guard stops matching.
+#
+# Optional parameters:
+#   check_safety_limits (true) - also check the target against the active safety
+#                                planes, joint limits and tool orientation limit,
+#                                not only whether inverse kinematics has a
+#                                solution. This is what catches a pose that is
+#                                reachable but would trip a protective stop.
+
+global cl_vel = 0.0
+global cl_acc = 0.0
+global cl_target = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+def script():
+  cl_vel = {{ velocity }}
+  cl_acc = {{ acceleration }}
+  if {{ global_velocity_scaling }} > 0.0 and {{ global_velocity_scaling }} <= 1.0:
+    cl_vel = cl_vel * {{ global_velocity_scaling }}
+  end
+  if {{ global_acceleration_scaling }} > 0.0 and {{ global_acceleration_scaling }} <= 1.0:
+    cl_acc = cl_acc * {{ global_acceleration_scaling }}
+  end
+
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  # get_forward_kin() with no argument returns the pose of the *active* TCP, so
+  # this has to come after set_tcp().
+  cl_target = pose_trans(get_forward_kin(), p{{ relative_pose }})
+
+  if not get_inverse_kin_has_solution(cl_target):
+    socket_send_line("Relative target is not reachable, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits(cl_target):
+    socket_send_line("Relative target is outside the active safety limits, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+
+  movel(cl_target, a=cl_acc, v=cl_vel
+  {%- if use_execution_time -%}
+  , t={{ execution_time }}
+  {%- endif -%}
+  {%- if use_blend_radius -%}
+  , r={{ blend_radius }}
+  {%- endif -%})
+  return True
+end

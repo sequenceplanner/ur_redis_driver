@@ -1,0 +1,30 @@
+# claude_set_digital_out
+#
+# New template. Sets one digital output, on any of the three banks the controller
+# exposes. start_vacuum / stop_vacuum / lock_rsp / unlock_rsp are each a
+# hard-coded instance of this; having the general one means a new actuator does
+# not need a new template and a new command type.
+#
+# Optional parameters:
+#   dout_bank  ("standard")  - "standard", "configurable" or "tool".
+#   dout_pin   (0)
+#   dout_value (true)        - JSON true/false; rendered as URScript True/False.
+#   dout_pulse (0.0)         - if > 0, the output is set, held for this many
+#                              seconds, and then driven back to the other state.
+
+{%- set bank = dout_bank | default(value="standard") %}
+{%- set pin = dout_pin | default(value=0) %}
+{%- if bank == "tool" %}{% set setter = "set_tool_digital_out" %}
+{%- elif bank == "configurable" %}{% set setter = "set_configurable_digital_out" %}
+{%- else %}{% set setter = "set_standard_digital_out" %}
+{%- endif %}
+
+def script():
+  {{ setter }}({{ pin }}, {% if dout_value | default(value=true) %}True{% else %}False{% endif %})
+  {%- if dout_pulse | default(value=0.0) > 0.0 %}
+  sleep({{ dout_pulse | default(value=0.0) }})
+  {{ setter }}({{ pin }}, {% if dout_value | default(value=true) %}False{% else %}True{% endif %})
+  {%- endif %}
+  socket_send_line("{{ bank }} DO {{ pin }} written", "ur_driver_socket")
+  return True
+end

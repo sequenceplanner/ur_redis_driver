@@ -1,0 +1,135 @@
+# claude_spiral_search
+#
+# New template. Presses down with a controlled force while walking an outward
+# spiral in the tool XY plane, and stops the moment the tool drops into the
+# feature it was looking for.
+#
+# This is the move that makes a peg-in-hole or a pin-into-bushing tolerant of the
+# few millimetres of error that a vision pick or a fixture stack-up leaves. The
+# driver has no compliant motion at all today, so the only way to attempt an
+# insertion is to command the nominal pose and let a protective stop tell you it
+# missed.
+#
+# Run it with the tool already at the entry pose, nominally over the feature.
+# force_threshold is not used here - the press force is push_force, and success
+# is measured by depth, not by force.
+#
+# TEST THIS IN URSIM BEFORE RUNNING IT ON HARDWARE. It is the only template in
+# this set that commands motion while force mode is active, and the right
+# radius, pitch and force are specific to the parts being assembled.
+#
+# Optional parameters:
+#   push_force        (20.0)  - N along tool +Z while searching.
+#   search_radius     (0.006) - m, radius the spiral grows to.
+#   search_revolutions (4)    - turns taken to get there.
+#   search_step       (0.3)   - rad of spiral angle per commanded point.
+#   insertion_depth   (0.003) - m of travel along tool Z that counts as "in".
+#   search_velocity   (0.01)  - m/s for the spiral points.
+#   search_max_time   (30.0)  - seconds before giving up.
+#   push_max_speed    (0.05), push_max_deviation (0.05)
+#   steady_timeout      (1.0)  - seconds to wait for the arm to reach standstill
+#                                before refusing. is_steady() needs 500ms of
+#                                stillness, so a single check would fail a script
+#                                that starts right after the previous one.
+
+global cl_pi = 3.14159265358979
+global cl_start = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+global cl_theta = 0.0
+global cl_theta_max = 0.0
+global cl_radius = 0.0
+global cl_depth = 0.0
+global cl_elapsed = 0.0
+global cl_found = False
+global cl_delta = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+def cl_wait_steady(timeout):
+  # is_steady() only turns true after 500ms of standstill with zero target
+  # velocity, so a script that starts right after the previous one finished
+  # braking sees false for up to half a second. Checking it once would fail
+  # perfectly good requests; this waits for it instead.
+  local waited = 0.0
+  while not is_steady():
+    if waited >= timeout:
+      return False
+    end
+    sleep(0.02)
+    waited = waited + 0.02
+  end
+  return True
+end
+
+def script():
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  if not cl_wait_steady({{ steady_timeout | default(value=1.0) }}):
+    socket_send_line("The arm did not come to a standstill, refusing to start a spiral search.", "ur_driver_socket")
+    return False
+  end
+
+  {%- if use_zero_ftsensor | default(value=true) %}
+  zero_ftsensor()
+  {%- endif %}
+  sleep(0.1)
+
+  cl_start = get_actual_tcp_pose()
+  cl_theta = 0.0
+  cl_theta_max = 2.0 * cl_pi * {{ search_revolutions | default(value=4) }}
+  cl_elapsed = 0.0
+  cl_found = False
+
+  # URScript has no wall clock, so the timeout is counted by a thread that ticks
+  # at a known rate. Counting loop iterations instead would measure spiral steps,
+  # not seconds, and a step takes as long as the movel in it happens to take.
+  thread timer_thread():
+    while True:
+      sleep(0.01)
+      cl_elapsed = cl_elapsed + 0.01
+    end
+  end
+  t_timer = run timer_thread()
+
+  socket_send_line("spiral search: {{ search_revolutions | default(value=4) }} turns out to {{ search_radius | default(value=0.006) }}m at {{ push_force | default(value=20.0) }}N", "ur_driver_socket")
+
+  # Compliant along tool Z only. The spiral is commanded in the two axes that
+  # stay position controlled, so the tool traces the pattern while the press
+  # force stays constant.
+  force_mode(cl_start, [0, 0, 1, 0, 0, 0], [0.0, 0.0, {{ push_force | default(value=20.0) }}, 0.0, 0.0, 0.0], 2, [{{ push_max_deviation | default(value=0.05) }}, {{ push_max_deviation | default(value=0.05) }}, {{ push_max_speed | default(value=0.05) }}, 0.17, 0.17, 0.17])
+
+  while cl_theta <= cl_theta_max and not cl_found:
+    cl_radius = {{ search_radius | default(value=0.006) }} * cl_theta / cl_theta_max
+    movel(pose_trans(cl_start, p[cl_radius * cos(cl_theta), cl_radius * sin(cl_theta), 0.0, 0.0, 0.0, 0.0]), a=0.2, v={{ search_velocity | default(value=0.01) }})
+
+    # How far the tool has travelled along its own Z since the search began.
+    # Expressed in the start frame so it is independent of the base orientation.
+    cl_delta = pose_trans(pose_inv(cl_start), get_actual_tcp_pose())
+    cl_depth = cl_delta[2]
+    if cl_depth > {{ insertion_depth | default(value=0.003) }}:
+      cl_found = True
+    end
+
+    cl_theta = cl_theta + {{ search_step | default(value=0.3) }}
+    if cl_elapsed > {{ search_max_time | default(value=30.0) }}:
+      socket_send_line("spiral search timed out after {{ search_max_time | default(value=30.0) }}s", "ur_driver_socket")
+      kill t_timer
+      end_force_mode()
+      stopl(1.0)
+      return False
+    end
+  end
+
+  kill t_timer
+  end_force_mode()
+  stopl(1.0)
+  sleep(0.2)
+
+  if cl_found:
+    socket_send_line("INSERTED depth=" + to_str(cl_depth) + " at " + to_str(get_actual_tcp_pose()), "ur_driver_socket")
+    return True
+  end
+
+  socket_send_line("spiral search finished without finding the feature, depth reached " + to_str(cl_depth), "ur_driver_socket")
+  return False
+end

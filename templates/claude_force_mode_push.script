@@ -1,0 +1,98 @@
+# claude_force_mode_push
+#
+# New template. Presses along the tool Z axis with a controlled force for a set
+# time, then releases.
+#
+# Everything force-related in the existing templates is a *guard*: it watches a
+# position-controlled move and aborts it. There is no way to ask for a force as
+# the goal. That is what seating a part in a fixture, holding a lid down while a
+# clamp closes, or keeping a sanding pad against a surface all need, and doing it
+# with position control means commanding into the workpiece and hoping the
+# stiffness works out.
+#
+# Runs force_mode compliant along tool Z, holds for the duration, then leaves
+# force mode and stops. The non-compliant axes stay position controlled, so the
+# tool does not wander.
+#
+# Duration comes from execution_time when use_execution_time is set.
+#
+# Optional parameters:
+#   push_force        (20.0)  - N along tool +Z. Negative pulls.
+#   push_time         (2.0)   - seconds, when execution_time is not used.
+#                               Approximate: counted in sleep(0.01) ticks, since
+#                               URScript has no wall clock.
+#   push_max_time     (60.0)
+#   push_max_speed    (0.05)  - m/s the compliant axis may move at.
+#   push_max_deviation (0.05) - m the position-controlled axes may deviate.
+#   steady_timeout      (1.0)  - seconds to wait for the arm to reach standstill
+#                                before refusing. is_steady() needs 500ms of
+#                                stillness, so a single check would fail a script
+#                                that starts right after the previous one.
+
+global cl_duration = 0.0
+global cl_frame = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+global cl_elapsed = 0.0
+
+def cl_wait_steady(timeout):
+  # is_steady() only turns true after 500ms of standstill with zero target
+  # velocity, so a script that starts right after the previous one finished
+  # braking sees false for up to half a second. Checking it once would fail
+  # perfectly good requests; this waits for it instead.
+  local waited = 0.0
+  while not is_steady():
+    if waited >= timeout:
+      return False
+    end
+    sleep(0.02)
+    waited = waited + 0.02
+  end
+  return True
+end
+
+def script():
+  {%- if use_execution_time %}
+  cl_duration = {{ execution_time }}
+  {%- else %}
+  cl_duration = {{ push_time | default(value=2.0) }}
+  {%- endif %}
+  if cl_duration <= 0.0:
+    cl_duration = {{ push_time | default(value=2.0) }}
+  end
+  if cl_duration > {{ push_max_time | default(value=60.0) }}:
+    cl_duration = {{ push_max_time | default(value=60.0) }}
+  end
+
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  if not cl_wait_steady({{ steady_timeout | default(value=1.0) }}):
+    socket_send_line("The arm did not come to a standstill, refusing to enter force mode.", "ur_driver_socket")
+    return False
+  end
+
+  {%- if use_zero_ftsensor | default(value=true) %}
+  zero_ftsensor()
+  {%- endif %}
+  sleep(0.1)
+
+  # The task frame is the tool frame as it is right now, held fixed for the whole
+  # push (force_mode type 2). Compliance is on the Z translation only.
+  cl_frame = get_actual_tcp_pose()
+  cl_elapsed = 0.0
+
+  socket_send_line("pushing at {{ push_force | default(value=20.0) }}N along tool Z for " + to_str(cl_duration) + "s", "ur_driver_socket")
+
+  force_mode(cl_frame, [0, 0, 1, 0, 0, 0], [0.0, 0.0, {{ push_force | default(value=20.0) }}, 0.0, 0.0, 0.0], 2, [{{ push_max_deviation | default(value=0.05) }}, {{ push_max_deviation | default(value=0.05) }}, {{ push_max_speed | default(value=0.05) }}, 0.17, 0.17, 0.17])
+  while cl_elapsed < cl_duration:
+    sleep(0.01)
+    cl_elapsed = cl_elapsed + 0.01
+  end
+  end_force_mode()
+  stopl(1.0)
+  sleep(0.2)
+
+  socket_send_line("push done, tcp=" + to_str(get_actual_tcp_pose()) + " wrench=" + to_str(get_tcp_force()), "ur_driver_socket")
+  return True
+end

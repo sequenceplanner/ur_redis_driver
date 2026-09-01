@@ -189,6 +189,14 @@ pub struct Waypoint {
     pub relative_pose: Vec<f64>,
     pub tcp_in_faceplate: String,
     pub force_threshold: f64,
+    /// Travel to this waypoint in a straight tool line (`movel`) rather than by
+    /// joint interpolation (`movej`).
+    ///
+    /// Orthogonal to `use_joint_positions`, which says how the *target* is
+    /// specified rather than how the arm gets there - `movel` accepts a joint
+    /// vector and moves to its forward kinematics in a straight line, which is
+    /// exactly what `trajectory_unsafe_move_l` already relies on.
+    pub use_linear_motion: bool,
 }
 
 // This arrives in the "waypoints" from redis
@@ -216,6 +224,9 @@ pub struct WaypointRaw {
     pub tcp_id: String,
     pub root_frame_id: String,
     pub force_threshold: f64,
+    /// See `Waypoint::use_linear_motion`. Optional on the wire, defaulting to
+    /// `false` (`movej`), which is what every existing publisher means.
+    pub use_linear_motion: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -276,6 +287,10 @@ pub struct RobotCommand {
     // flush the controller's look-ahead buffer, breaking the blend. Off means a
     // guaranteed-smooth blend and no mid-trajectory resume.
     pub report_waypoint_progress: bool,
+    /// Name of a trajectory stored under the trajectory directory, without the
+    /// `.json`. Empty means "there is no stored trajectory": either this is not a
+    /// trajectory command at all, or it is one to be planned from `waypoints`.
+    pub trajectory_id: String,
     pub waypoints: Vec<Waypoint>
     // pub gripper_velocity: f64,
     // pub gripper_force: f64,
@@ -525,6 +540,21 @@ impl WaypointRaw {
                 }
             };
 
+            // Optional fields must NOT use `get_bool(..)?`: a missing key there
+            // returns None, which aborts the whole waypoint list and therefore the
+            // whole request. Every publisher written before a field existed would
+            // start failing. New fields get a default instead.
+            let get_bool_or = |k: &str, default: bool| -> bool {
+                match get_val(k) {
+                    Some(SPValue::Bool(BoolOrUnknown::Bool(b))) => *b,
+                    Some(other) => {
+                        log::warn!(target: log_target, "Waypoint {}: Field '{}' expected Bool, got {:?}; using {}.", index, k, other, default);
+                        default
+                    }
+                    None => default,
+                }
+            };
+
             let use_joint_positions = get_bool("use_joint_positions")?;
 
             extracted.push(WaypointRaw {
@@ -556,6 +586,7 @@ impl WaypointRaw {
                 tcp_id: get_string("tcp_id")?,
                 root_frame_id: get_string("root_frame_id")?,
                 force_threshold: get_f64("force_threshold")?,
+                use_linear_motion: get_bool_or("use_linear_motion", false),
             });
         }
 

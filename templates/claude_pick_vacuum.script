@@ -1,0 +1,252 @@
+# claude_pick_vacuum
+#
+# Descends until the part is touched, switches the vacuum on at the moment of
+# contact, lets it build, and retracts.
+#
+# Fixes over pick_vacuum.script. pick_vacuum_broken.script has one more on top of
+# these: neither of its force monitors ever sets force_detected. The monitor sees
+# contact, switches the vacuum on and breaks out of its own loop - but the wait
+# below it is `while not move_done and not force_detected`, so nothing stops the
+# descent. The arm keeps pressing the cup into the part for the rest of the
+# 0.2 m stroke. That is the bug the "_broken" in its name is about.
+#
+#   1. set_payload({{ payload }}) is a runtime error. Payload::to_string() emits
+#      "mass,[cog],[inertia]", three arguments, and set_payload() takes two.
+#      set_target_payload() is the one that matches. The same bug is in
+#      pick_vacuum_broken.script.
+#
+#   2. The approach was hard-coded. pick_vacuum.script descends
+#      p[0,0,0.2,0,0,0] at a=0.1, v=0.05 and retracts 0.1 m, ignoring
+#      relative_pose, acceleration and velocity even though it interpolates
+#      {{ acceleration }} and {{ velocity }} into the retract move - so the two
+#      halves of the same pick ran at different speeds for no stated reason.
+#      Here the descent is relative_pose and both moves use the request's speeds.
+#
+#   3. The force guard compares against a baseline sampled at standstill instead
+#      of against the raw wrench, which includes the weight of the tool. See
+#      claude_safe_move_j.script for the full reasoning.
+#
+#   4. force_threshold = 0.0 is refused outright rather than firing the vacuum on
+#      the first sample. A pick that triggers instantly picks up nothing and the
+#      cell has no way to tell.
+#
+#   5. There is a dwell between the vacuum coming on and the retract starting.
+#      The original killed the descent, slept 0.5 s, and pulled up - which is a
+#      dwell by accident. Making it explicit means it can be tuned, and it can be
+#      replaced by a real vacuum switch: set vacuum_ok_pin and the script waits
+#      for the switch instead of guessing, and fails the pick if it never comes.
+#
+#   6. Descending the whole way without touching anything is now a failure. The
+#      original set move_done, skipped the vacuum entirely, and retracted with
+#      the cup empty, then returned True.
+#
+#   7. The snag check on the way up used set_tool_digital_out(1, True) to flag
+#      the operator and then returned True anyway. It now fails the request, and
+#      the pin is a parameter.
+#
+# Optional parameters:
+#   vacuum_pin        (0)    - see claude_start_vacuum.script for the pin conflict.
+#   vacuum_ok_pin     (-1)   - standard DI from the vacuum switch. -1 disables.
+#   vacuum_dwell      (0.5)  - seconds to let vacuum build before retracting.
+#   retract_distance  (0.1)  - m along tool -Z after the pick.
+#   snag_pin          (-1)   - tool DO to raise if the retract meets resistance.
+#   use_zero_ftsensor (true), force_settle_time (0.3), stop_acceleration (1.5)
+#   check_safety_limits (true) - also check the target against the active safety
+#                                planes, joint limits and tool orientation limit,
+#                                not only whether inverse kinematics has a
+#                                solution. This is what catches a pose that is
+#                                reachable but would trip a protective stop.
+
+global cl_move_done = False
+global cl_force_detected = False
+global cl_vel = 0.0
+global cl_acc = 0.0
+global cl_threshold = 0.0
+global cl_settle = 0.0
+global cl_base_f = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+global cl_peak = 0.0
+global cl_target = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+global cl_waited = 0.0
+
+def script():
+  cl_threshold = {{ force_threshold }}
+  cl_settle = {{ force_settle_time | default(value=0.3) }}
+  if cl_threshold <= 0.0:
+    socket_send_line("force_threshold must be greater than 0 for a vacuum pick.", "ur_driver_socket")
+    return False
+  end
+
+  cl_vel = {{ velocity }}
+  cl_acc = {{ acceleration }}
+  if {{ global_velocity_scaling }} > 0.0 and {{ global_velocity_scaling }} <= 1.0:
+    cl_vel = cl_vel * {{ global_velocity_scaling }}
+  end
+  if {{ global_acceleration_scaling }} > 0.0 and {{ global_acceleration_scaling }} <= 1.0:
+    cl_acc = cl_acc * {{ global_acceleration_scaling }}
+  end
+
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  # ---------- descend until the part is touched ----------
+  cl_move_done = False
+  cl_force_detected = False
+  cl_peak = 0.0
+  cl_target = pose_trans(get_forward_kin(), p{{ relative_pose }})
+  if not get_inverse_kin_has_solution(cl_target):
+    socket_send_line("The bottom of the pick approach is not reachable, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits(cl_target):
+    socket_send_line("The bottom of the pick approach is outside the active safety limits, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+
+  {%- if use_zero_ftsensor | default(value=true) %}
+  zero_ftsensor()
+  {%- endif %}
+  sleep(0.1)
+  cl_base_f = get_tcp_force()
+
+  thread move_down_thread():
+    movel(cl_target, a=cl_acc, v=cl_vel)
+    cl_move_done = True
+  end
+
+  thread force_monitor_down_thread():
+    sleep(cl_settle)
+    while not cl_move_done:
+      w = get_tcp_force()
+      dx = w[0] - cl_base_f[0]
+      dy = w[1] - cl_base_f[1]
+      dz = w[2] - cl_base_f[2]
+      mag = sqrt(dx * dx + dy * dy + dz * dz)
+      if mag > cl_peak:
+        cl_peak = mag
+      end
+      if mag > cl_threshold:
+        # Vacuum on at the instant of contact, before the arm has finished
+        # braking, so the cup seals while it is still loaded against the part.
+        set_standard_digital_out({{ vacuum_pin | default(value=0) }}, True)
+        cl_force_detected = True
+        break
+      end
+      sleep(0.002)
+    end
+  end
+
+  t_move_down = run move_down_thread()
+  t_force_down = run force_monitor_down_thread()
+
+  while not cl_move_done and not cl_force_detected:
+    sleep(0.002)
+  end
+
+  kill t_move_down
+  kill t_force_down
+  stopl({{ stop_acceleration | default(value=1.5) }})
+  sleep(0.2)
+
+  if not cl_force_detected:
+    socket_send_line("Reached the end of the approach without touching anything, no part to pick.", "ur_driver_socket")
+    set_standard_digital_out({{ vacuum_pin | default(value=0) }}, False)
+    return False
+  end
+
+  socket_send_line("contact at " + to_str(get_actual_tcp_pose()) + ", vacuum on", "ur_driver_socket")
+
+  # ---------- let the vacuum build ----------
+  {%- if vacuum_ok_pin | default(value=-1) >= 0 %}
+  cl_waited = 0.0
+  while not get_standard_digital_in({{ vacuum_ok_pin | default(value=-1) }}):
+    if cl_waited >= {{ vacuum_dwell | default(value=0.5) }}:
+      socket_send_line("The vacuum switch never confirmed a part, releasing.", "ur_driver_socket")
+      set_standard_digital_out({{ vacuum_pin | default(value=0) }}, False)
+      return False
+    end
+    sleep(0.01)
+    cl_waited = cl_waited + 0.01
+  end
+  {%- else %}
+  sleep({{ vacuum_dwell | default(value=0.5) }})
+  {%- endif %}
+
+  # ---------- retract ----------
+  cl_move_done = False
+  cl_force_detected = False
+  cl_peak = 0.0
+  cl_target = pose_trans(get_forward_kin(), p[0.0, 0.0, -{{ retract_distance | default(value=0.1) }}, 0.0, 0.0, 0.0])
+  if not get_inverse_kin_has_solution(cl_target):
+    socket_send_line("The retract target is not reachable, aborting with the part held.", "ur_driver_socket")
+    return False
+  end
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits(cl_target):
+    socket_send_line("The retract target is outside the active safety limits.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+
+  # The baseline is re-sampled here: the part is on the cup now, so its weight is
+  # part of the resting wrench and must not be read as a snag.
+  sleep(0.1)
+  cl_base_f = get_tcp_force()
+
+  thread move_up_thread():
+    movel(cl_target, a=cl_acc, v=cl_vel)
+    cl_move_done = True
+  end
+
+  thread force_monitor_up_thread():
+    sleep(cl_settle)
+    while not cl_move_done:
+      w = get_tcp_force()
+      dx = w[0] - cl_base_f[0]
+      dy = w[1] - cl_base_f[1]
+      dz = w[2] - cl_base_f[2]
+      mag = sqrt(dx * dx + dy * dy + dz * dz)
+      if mag > cl_peak:
+        cl_peak = mag
+      end
+      if mag > cl_threshold:
+        cl_force_detected = True
+        break
+      end
+      sleep(0.002)
+    end
+  end
+
+  t_move_up = run move_up_thread()
+  t_force_up = run force_monitor_up_thread()
+
+  while not cl_move_done and not cl_force_detected:
+    sleep(0.002)
+  end
+
+  kill t_move_up
+  kill t_force_up
+  stopl({{ stop_acceleration | default(value=1.5) }})
+  sleep(0.3)
+
+  if cl_force_detected:
+    {%- if snag_pin | default(value=-1) >= 0 %}
+    set_tool_digital_out({{ snag_pin | default(value=-1) }}, True)
+    {%- endif %}
+    socket_send_line("The part snagged on the way up, peak " + to_str(cl_peak) + "N. Stopped with the part held.", "ur_driver_socket")
+    return False
+  end
+
+  {%- if vacuum_ok_pin | default(value=-1) >= 0 %}
+  if not get_standard_digital_in({{ vacuum_ok_pin | default(value=-1) }}):
+    socket_send_line("The part was lost during the retract.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+
+  socket_send_line("pick complete at " + to_str(get_actual_tcp_pose()), "ur_driver_socket")
+  return True
+end

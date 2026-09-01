@@ -75,6 +75,7 @@ pub async fn command_server(
         "relative_pose",
         "force_feedback",
         "report_waypoint_progress",
+        "trajectory_id",
         "waypoints",
     ];
 
@@ -257,6 +258,13 @@ pub async fn command_server(
                     true,
                     &log_target,
                 );
+                // Empty means "plan from the waypoints in this request"; a name
+                // means "run the stored trajectory of that name".
+                let trajectory_id = state.get_string_or_value(
+                    &key("trajectory_id"),
+                    String::new(),
+                    &log_target,
+                );
 
                 let extract_f64_array = |state_key: &str, default_arr: &[f64]| -> Vec<f64> {
                     if let Some(micro_sp::SPValue::Array(ArrayOrUnknown::Array(values))) =
@@ -304,6 +312,9 @@ pub async fn command_server(
                     && !use_relative_pose
                     && command_type != "lock_rsp"
                     && command_type != "unlock_rsp"
+                    // A planned trajectory's targets live in its waypoints, and its
+                    // TCP lookup is done below like any other trajectory command.
+                    && !is_planner_command(&command_type)
                 {
                     target_in_base = match TransformsManager::lookup_transform(
                         &mut con,
@@ -437,6 +448,7 @@ pub async fn command_server(
                         relative_pose: wpr.relative_pose,
                         tcp_in_faceplate: tcp_in_faceplate.clone(), // we dont want to change tcps in a blended move
                         force_threshold: wpr.force_threshold,
+                        use_linear_motion: wpr.use_linear_motion,
                     });
                 }
 
@@ -468,7 +480,54 @@ pub async fn command_server(
                     force_threshold,
                     relative_pose,
                     report_waypoint_progress,
+                    trajectory_id,
                     waypoints,
+                };
+
+                // --- planning hook ---
+                //
+                // A planned trajectory replaces its waypoint list with one the
+                // planner produced: explicit joint targets, per-segment velocity
+                // and acceleration at the joint limits, and blend radii that will
+                // not make the controller skip a move. Everything downstream -
+                // rendering, the goal loop, pause and resume - is unchanged,
+                // because what it sees is an ordinary blended trajectory.
+                //
+                // Planning is pure arithmetic and takes single-digit milliseconds,
+                // so it runs inline here rather than on the local pool.
+                let robot_command = if is_planner_command(&robot_command.command_type) {
+                    let current_joints = {
+                        let ds = lock_driver_state(&driver_state);
+                        ds.joint_values.clone()
+                    };
+                    match waypoints_for_command(&robot_command, &current_joints) {
+                        Ok((waypoints, trajectory)) => {
+                            log::info!(
+                                target: &log_target,
+                                "Planned {} waypoints, estimated {:.2} s.",
+                                waypoints.len(),
+                                trajectory.duration_estimate
+                            );
+                            for warning in &trajectory.warnings {
+                                log::warn!(target: &log_target, "{}", warning);
+                            }
+                            let mut planned = robot_command;
+                            planned.waypoints = waypoints;
+                            planned
+                        }
+                        Err(e) => {
+                            fail_request(
+                                &mut con,
+                                robot_name,
+                                &format!("trajectory planning failed: {}", e),
+                                &log_target,
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                } else {
+                    robot_command
                 };
 
                 let script = match generate_core_script_from_template(

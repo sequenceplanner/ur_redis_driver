@@ -69,6 +69,8 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     // reported trajectory can resume mid-path; see `RobotCommand`.
     let report_waypoint_progress =
         bv!(&&format!("{}_report_waypoint_progress", robot_name));
+    // Names a stored trajectory to run. Empty means "plan from `waypoints`".
+    let trajectory_id = v!(&&format!("{}_trajectory_id", robot_name));
 
     // Measured state, written by `state_publisher` from what `realtime_reader`
     // decodes off the RT stream. None of this used to leave the process.
@@ -124,6 +126,10 @@ pub fn generate_robot_interface_state(robot_name: &str, log_target: &str) -> Sta
     let state = state.add(assign!(waypoints, SPValue::Array(ArrayOrUnknown::UNKNOWN)), &log_target);
     // Seeded true, matching the default `command_server` falls back to.
     let state = state.add(assign!(report_waypoint_progress, true.to_spvalue()), &log_target);
+    // Seeded to "" rather than UNKNOWN: empty is the meaningful default ("plan
+    // from the waypoints"), and `command_server` fails any request whose full key
+    // set is not present, so this key must exist for *every* request to work.
+    let state = state.add(assign!(trajectory_id, "".to_spvalue()), &log_target);
 
     let state = state.add(assign!(safety_mode, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);
     let state = state.add(assign!(robot_mode, SPValue::String(StringOrUnknown::UNKNOWN)), &log_target);

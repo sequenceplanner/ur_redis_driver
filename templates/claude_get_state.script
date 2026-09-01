@@ -1,0 +1,43 @@
+# claude_get_state
+#
+# New template. One-shot snapshot of everything the realtime stream does not give
+# the driver in a form tied to a request.
+#
+# realtime_reader already publishes joints, TCP pose and forces continuously, so
+# this is not a substitute for that. What it adds is a reading taken *at a known
+# point in a sequence* - after a pick, before a place - reported on the same
+# socket as the request that asked for it, and the per-pin digital inputs that
+# the packed digital_inputs bitmask makes awkward to read.
+#
+# Everything goes out as one line, because each line overwrites
+# <robot>_request_feedback.
+
+global cl_din = ""
+global cl_tin = ""
+global cl_i = 0
+
+def script():
+  set_tcp({{ tcp_in_faceplate }})
+  cl_din = ""
+  cl_i = 0
+  while cl_i < 8:
+    if get_standard_digital_in(cl_i):
+      cl_din = cl_din + "1"
+    else:
+      cl_din = cl_din + "0"
+    end
+    cl_i = cl_i + 1
+  end
+  cl_tin = ""
+  cl_i = 0
+  while cl_i < 2:
+    if get_tool_digital_in(cl_i):
+      cl_tin = cl_tin + "1"
+    else:
+      cl_tin = cl_tin + "0"
+    end
+    cl_i = cl_i + 1
+  end
+  socket_send_line("STATE tcp=" + to_str(get_actual_tcp_pose()) + " q=" + to_str(get_actual_joint_positions()) + " tcp_speed=" + to_str(get_actual_tcp_speed()) + " wrench=" + to_str(get_tcp_force()) + " std_din=" + cl_din + " tool_din=" + cl_tin + " steady=" + to_str(is_steady()), "ur_driver_socket")
+  return True
+end

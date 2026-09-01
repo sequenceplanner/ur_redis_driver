@@ -1,0 +1,44 @@
+# claude_set_tcp
+#
+# New template. Sets the active TCP from tcp_in_faceplate and leaves it set.
+#
+# Every move template calls set_tcp() itself, so the active TCP only ever lasts
+# as long as one script. That is the right default, but there was no way to
+# establish a TCP once - for a freedrive teach-in, for a manual jog from the
+# pendant, or just to check that the transform the driver looked up is the one
+# the operator expects. The offset is echoed back on the socket for that.
+#
+# Optional parameters:
+#   steady_timeout      (1.0)  - seconds to wait for the arm to reach standstill
+#                                before refusing. is_steady() needs 500ms of
+#                                stillness, so a single check would fail a script
+#                                that starts right after the previous one.
+
+def cl_wait_steady(timeout):
+  # is_steady() only turns true after 500ms of standstill with zero target
+  # velocity, so a script that starts right after the previous one finished
+  # braking sees false for up to half a second. Checking it once would fail
+  # perfectly good requests; this waits for it instead.
+  local waited = 0.0
+  while not is_steady():
+    if waited >= timeout:
+      return False
+    end
+    sleep(0.02)
+    waited = waited + 0.02
+  end
+  return True
+end
+
+def script():
+  if not cl_wait_steady({{ steady_timeout | default(value=1.0) }}):
+    socket_send_line("The arm did not come to a standstill, refusing to change the TCP.", "ur_driver_socket")
+    return False
+  end
+  set_tcp({{ tcp_in_faceplate }})
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  socket_send_line("tcp set to {{ tcp_in_faceplate }}, tcp now at " + to_str(get_actual_tcp_pose()), "ur_driver_socket")
+  return True
+end

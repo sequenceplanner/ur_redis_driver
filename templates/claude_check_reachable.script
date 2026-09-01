@@ -1,0 +1,54 @@
+# claude_check_reachable
+#
+# New template. Solves inverse kinematics for the target and reports the result
+# without moving anything.
+#
+# The driver has no dry run. A target frame that is out of reach, or that is only
+# reachable through a wrist flip, is discovered by sending the arm at it. This
+# answers the same question for the cost of one script, which makes it usable as
+# a precondition in a planner: check every frame in a sequence, then commit.
+#
+# Returns True when a solution exists, False when it does not, so the answer is
+# the request result rather than something to parse out of the feedback.
+#
+# Optional parameters:
+#   check_safety_limits (true) - also check the target against the active safety
+#                                planes, joint limits and tool orientation limit,
+#                                not only whether inverse kinematics has a
+#                                solution. This is what catches a pose that is
+#                                reachable but would trip a protective stop.
+
+global cl_q = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+def script():
+  set_tcp({{ tcp_in_faceplate }})
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+
+  if point_dist({{ target_in_base }}, p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) < 0.001:
+    socket_send_line("REACHABLE false reason=target_is_base_origin", "ur_driver_socket")
+    return False
+  end
+
+  if not get_inverse_kin_has_solution({{ target_in_base }}
+  {%- if use_preferred_joint_config -%}
+  , qnear={{ preferred_joint_config }}
+  {%- endif -%}):
+    socket_send_line("REACHABLE false target={{ target_in_base }}", "ur_driver_socket")
+    return False
+  end
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits({{ target_in_base }}):
+    socket_send_line("REACHABLE false reason=outside_safety_limits target={{ target_in_base }}", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+
+  cl_q = get_inverse_kin({{ target_in_base }}
+  {%- if use_preferred_joint_config -%}
+  , qnear={{ preferred_joint_config }}
+  {%- endif -%})
+  socket_send_line("REACHABLE true target={{ target_in_base }} q=" + to_str(cl_q) + " from_q=" + to_str(get_actual_joint_positions()), "ur_driver_socket")
+  return True
+end

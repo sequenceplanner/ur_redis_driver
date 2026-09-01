@@ -1,0 +1,184 @@
+# claude_safe_move_j
+#
+# movej with a force guard: a monitor thread stops the motion as soon as the
+# contact wrench at the TCP exceeds force_threshold.
+#
+# Fixes over safe_move_j.script (all of these apply to safe_move_l and
+# safe_move_l_relative too):
+#
+#   1. force_threshold = 0.0 no longer aborts the move on the first sample.
+#      command_server reads force_threshold with get_float_or_default_to_zero, so
+#      a caller that does not set the key gets 0.0. force() is a magnitude, so
+#      "force > 0.0" is true on the very first reading and every such move was
+#      aborted before it moved. A threshold of 0.0 or less now means "monitoring
+#      disabled" and the move runs unguarded, which is what a caller who never
+#      set a threshold meant.
+#
+#   2. The guard measures a *delta*, not an absolute. force() and get_tcp_force()
+#      include the weight of the payload and of the tool itself, so on a UR20
+#      with a 2 kg tool the reading sits around 20 N before anything is touched.
+#      The sensor is zeroed (optional, see use_zero_ftsensor) and a baseline is
+#      sampled at standstill, and the guard compares against that. A threshold
+#      now means "N of contact force", which is what a caller expects.
+#
+#   3. `force = force()` is gone. Assigning to a variable named `force` shadows
+#      the builtin function of the same name for the rest of that scope, which is
+#      a trap waiting for anyone who adds a second read to the loop.
+#
+#   4. `force < -threshold` was dead code. force() returns a magnitude and is
+#      never negative.
+#
+#   5. A settling delay before monitoring starts, so the acceleration transient
+#      at the beginning of the move does not trip the guard. The original had one
+#      in pick_vacuum's retract but not in the safe_move templates.
+#
+#   6. A stop reports *why*. The original returned False and the driver wrote
+#      "aborted before reaching the goal", identical to a dashboard stop or a
+#      protective stop. This sends the peak force and the threshold on the script
+#      socket first, which command_server publishes to <robot>_request_feedback.
+#
+#   7. global_velocity_scaling / global_acceleration_scaling are applied.
+#
+#   8. The IK solver runs once instead of twice, after set_tcp().
+#
+# Optional parameters (fall back to the defaults shown until they are added to
+# RobotCommand and to command_server's `suffixes`):
+#   use_zero_ftsensor  (true)  - zero the F/T sensor before sampling the baseline.
+#                                e-Series only; set false on a CB3.
+#   force_settle_time  (0.3)   - seconds to ignore force after the move starts.
+#   stop_acceleration  (5.0)   - rad/s^2 used to decelerate on a force stop.
+#   check_safety_limits (true) - also check the target against the active safety
+#                                planes, joint limits and tool orientation limit,
+#                                not only whether inverse kinematics has a
+#                                solution. This is what catches a pose that is
+#                                reachable but would trip a protective stop.
+
+global cl_move_done = False
+global cl_force_detected = False
+global cl_ik_failed = False
+global cl_vel = 0.0
+global cl_acc = 0.0
+global cl_q = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+global cl_threshold = 0.0
+global cl_settle = 0.0
+global cl_base_f = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+global cl_peak = 0.0
+
+def script():
+  cl_move_done = False
+  cl_force_detected = False
+  cl_ik_failed = False
+  cl_peak = 0.0
+  cl_threshold = {{ force_threshold }}
+  cl_settle = {{ force_settle_time | default(value=0.3) }}
+
+  cl_vel = {{ velocity }}
+  cl_acc = {{ acceleration }}
+  if {{ global_velocity_scaling }} > 0.0 and {{ global_velocity_scaling }} <= 1.0:
+    cl_vel = cl_vel * {{ global_velocity_scaling }}
+  end
+  if {{ global_acceleration_scaling }} > 0.0 and {{ global_acceleration_scaling }} <= 1.0:
+    cl_acc = cl_acc * {{ global_acceleration_scaling }}
+  end
+
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+  {%- if not use_joint_positions %}
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits({{ target_in_base }}):
+    socket_send_line("Target pose is outside the active safety limits, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+  {%- endif %}
+
+  if cl_threshold > 0.0:
+    {%- if use_zero_ftsensor | default(value=true) %}
+    zero_ftsensor()
+    {%- endif %}
+    # Sample the resting wrench so the tool's own weight is not read as contact.
+    sleep(0.1)
+    cl_base_f = get_tcp_force()
+  else:
+    socket_send_line("force_threshold is 0, force monitoring is disabled for this move.", "ur_driver_socket")
+  end
+
+  thread move_thread():
+    {% if use_joint_positions -%}
+    movej({{ joint_positions }}, a=cl_acc, v=cl_vel
+    {%- if use_execution_time -%}
+    , t={{ execution_time }}
+    {%- endif -%}
+    {%- if use_blend_radius -%}
+    , r={{ blend_radius }}
+    {%- endif -%})
+    cl_move_done = True
+    {% else -%}
+    if get_inverse_kin_has_solution({{ target_in_base }}
+    {%- if use_preferred_joint_config -%}
+    , qnear={{ preferred_joint_config }}
+    {%- endif -%}):
+      cl_q = get_inverse_kin({{ target_in_base }}
+      {%- if use_preferred_joint_config -%}
+      , qnear={{ preferred_joint_config }}
+      {%- endif -%})
+      socket_send_line("Solution found, start movej.", "ur_driver_socket")
+      movej(cl_q, a=cl_acc, v=cl_vel
+      {%- if use_execution_time -%}
+      , t={{ execution_time }}
+      {%- endif -%}
+      {%- if use_blend_radius -%}
+      , r={{ blend_radius }}
+      {%- endif -%})
+      cl_move_done = True
+    else:
+      socket_send_line("No inverse kinematics solution found, aborting.", "ur_driver_socket")
+      cl_ik_failed = True
+    end
+    {%- endif %}
+  end
+
+  thread force_monitor_thread():
+    if cl_threshold > 0.0:
+      sleep(cl_settle)
+      while not cl_move_done and not cl_ik_failed:
+        w = get_tcp_force()
+        dx = w[0] - cl_base_f[0]
+        dy = w[1] - cl_base_f[1]
+        dz = w[2] - cl_base_f[2]
+        mag = sqrt(dx * dx + dy * dy + dz * dz)
+        if mag > cl_peak:
+          cl_peak = mag
+        end
+        if mag > cl_threshold:
+          cl_force_detected = True
+          break
+        end
+        sleep(0.002)
+      end
+    end
+  end
+
+  t_move = run move_thread()
+  t_force = run force_monitor_thread()
+
+  while not cl_move_done and not cl_force_detected and not cl_ik_failed:
+    sleep(0.002)
+  end
+
+  kill t_move
+  kill t_force
+  stopj({{ stop_acceleration | default(value=5.0) }})
+  sleep(0.5)
+
+  if cl_force_detected:
+    socket_send_line("force_stop peak=" + to_str(cl_peak) + "N threshold=" + to_str(cl_threshold) + "N", "ur_driver_socket")
+    return False
+  end
+  if cl_ik_failed:
+    return False
+  end
+  return cl_move_done
+end

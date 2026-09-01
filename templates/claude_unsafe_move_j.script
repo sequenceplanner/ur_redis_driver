@@ -1,0 +1,85 @@
+# claude_unsafe_move_j
+#
+# movej to an explicit joint configuration, or to a Cartesian target resolved with
+# inverse kinematics. Unguarded: nothing watches the force while it runs.
+#
+# Fixes over unsafe_move_j.script:
+#   * global_velocity_scaling / global_acceleration_scaling are applied. Both are
+#     read out of Redis by command_server and were ignored by every template. A
+#     value outside (0.0, 1.0] is treated as "no scaling", so the driver's default
+#     of 0.0 does not freeze the robot.
+#   * The IK solver runs once instead of twice. get_inverse_kin() is not
+#     guaranteed to return the same branch on two separate calls, so checking one
+#     solution and then moving to another one is a real (if rare) hazard.
+#   * set_tcp() is issued before the IK call. get_inverse_kin() solves for
+#     whatever TCP is active at the time, so setting it afterwards solved for the
+#     wrong tool.
+#   * The unreachable `return True` after the if/else is gone.
+#
+# Optional parameters (not in RobotCommand yet - they fall back to the defaults
+# shown here until they are added to the struct and to command_server's suffixes):
+#   none
+#   check_safety_limits (true) - also check the target against the active safety
+#                                planes, joint limits and tool orientation limit,
+#                                not only whether inverse kinematics has a
+#                                solution. This is what catches a pose that is
+#                                reachable but would trip a protective stop.
+
+global cl_vel = 0.0
+global cl_acc = 0.0
+global cl_q = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+def script():
+  cl_vel = {{ velocity }}
+  cl_acc = {{ acceleration }}
+  if {{ global_velocity_scaling }} > 0.0 and {{ global_velocity_scaling }} <= 1.0:
+    cl_vel = cl_vel * {{ global_velocity_scaling }}
+  end
+  if {{ global_acceleration_scaling }} > 0.0 and {{ global_acceleration_scaling }} <= 1.0:
+    cl_acc = cl_acc * {{ global_acceleration_scaling }}
+  end
+
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  {% if use_joint_positions -%}
+  socket_send_line("movej to explicit joint positions, no inverse kinematics.", "ur_driver_socket")
+  movej({{ joint_positions }}, a=cl_acc, v=cl_vel
+  {%- if use_execution_time -%}
+  , t={{ execution_time }}
+  {%- endif -%}
+  {%- if use_blend_radius -%}
+  , r={{ blend_radius }}
+  {%- endif -%})
+  return True
+  {% else -%}
+  if not get_inverse_kin_has_solution({{ target_in_base }}
+  {%- if use_preferred_joint_config -%}
+  , qnear={{ preferred_joint_config }}
+  {%- endif -%}):
+    socket_send_line("No inverse kinematics solution for the target pose, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits({{ target_in_base }}):
+    socket_send_line("Target pose is outside the active safety limits, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+  cl_q = get_inverse_kin({{ target_in_base }}
+  {%- if use_preferred_joint_config -%}
+  , qnear={{ preferred_joint_config }}
+  {%- endif -%})
+  socket_send_line("Solution found, start movej.", "ur_driver_socket")
+  movej(cl_q, a=cl_acc, v=cl_vel
+  {%- if use_execution_time -%}
+  , t={{ execution_time }}
+  {%- endif -%}
+  {%- if use_blend_radius -%}
+  , r={{ blend_radius }}
+  {%- endif -%})
+  return True
+  {%- endif %}
+end

@@ -25,6 +25,12 @@ pub use interfaces::state_publisher::*;
 // pub use ros::urdf_parsing::*;
 // pub use ros::joint_subscriber::*;
 
+pub mod trajectory;
+// Only the online bridge is re-exported at the crate root. The rest of the module
+// defines `Pose`, `Limits` and friends, which would collide with the `k::` and
+// `micro_sp::` globs already in scope across this crate.
+pub use trajectory::online::*;
+
 pub mod tools;
 pub use tools::generate_ur_script::*;
 

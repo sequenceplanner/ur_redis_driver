@@ -1,0 +1,28 @@
+# claude_start_vacuum
+#
+# IMPORTANT - this is the one fix in this whole set that can drop a tool on the
+# floor. The existing templates disagree about which digital output the vacuum is
+# on, and one of the two choices is the tool changer:
+#
+#   start_vacuum.script    set_digital_out(1, True)           -> standard DO 1
+#   stop_vacuum.script     set_digital_out(1, False)          -> standard DO 1
+#   pick_vacuum.script     set_standard_digital_out(0, True)  -> standard DO 0
+#   place_vacuum.script    set_standard_digital_out(0, False) -> standard DO 0
+#   unlock_rsp.script      set_standard_digital_out(1, True)  -> standard DO 1
+#   lock_rsp.script        set_standard_digital_out(1, False) -> standard DO 1
+#
+# set_digital_out() is only the deprecated alias of set_standard_digital_out(),
+# so start_vacuum and unlock_rsp write the *same physical pin*. On this wiring,
+# asking for vacuum releases the RSP tool changer.
+#
+# These templates default to DO 0 for the vacuum, matching pick_vacuum and
+# place_vacuum, which are the ones that were clearly written against the real
+# cell. Check the cabinet before trusting either. The pin is a parameter so it
+# can be corrected in one place - see CLAUDE_TEMPLATES.md for how to wire
+# vacuum_pin through RobotCommand.
+
+def script():
+  set_standard_digital_out({{ vacuum_pin | default(value=0) }}, True)
+  socket_send_line("vacuum on (standard DO {{ vacuum_pin | default(value=0) }})", "ur_driver_socket")
+  return True
+end

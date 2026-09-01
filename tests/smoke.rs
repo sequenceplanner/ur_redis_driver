@@ -133,6 +133,7 @@ fn trajectory_templates_render() {
         relative_pose: vec![0.0; 6],
         tcp_in_faceplate: "p[0,0,0,0,0,0]".to_string(),
         force_threshold: 0.0,
+        use_linear_motion: false,
     };
 
     let command = |report: bool| RobotCommand {
@@ -156,6 +157,7 @@ fn trajectory_templates_render() {
         tcp_in_faceplate: "p[0,0,0,0,0,0]".to_string(),
         force_threshold: 0.0,
         report_waypoint_progress: report,
+        trajectory_id: String::new(),
         waypoints: vec![waypoint(), waypoint(), waypoint()],
     };
 

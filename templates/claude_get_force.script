@@ -1,0 +1,23 @@
+# claude_get_force
+#
+# Reports the wrench at the TCP.
+#
+# Fixes over get_force.script:
+#   * `force = force()` shadowed the builtin. Renamed.
+#   * force() alone is a single magnitude that already includes the weight of the
+#     tool, so it says very little on its own. This reports the full wrench and
+#     the magnitude of its translational part next to it.
+#   * The TCP is set first, because the wrench is reported at the TCP and the
+#     torques change with it.
+#   * One line instead of several. Each line the script sends lands in
+#     <robot>_request_feedback, and a later line overwrites an earlier one, so a
+#     multi-line report is a race against whoever is reading it.
+
+global cl_w = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+def script():
+  set_tcp({{ tcp_in_faceplate }})
+  cl_w = get_tcp_force()
+  socket_send_line("FORCE wrench=" + to_str(cl_w) + " magnitude=" + to_str(sqrt(cl_w[0] * cl_w[0] + cl_w[1] * cl_w[1] + cl_w[2] * cl_w[2])) + " scalar=" + to_str(force()), "ur_driver_socket")
+  return True
+end

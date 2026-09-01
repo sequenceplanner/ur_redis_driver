@@ -1,0 +1,165 @@
+# claude_trajectory_unsafe_move_j
+#
+# A blended sequence of movej waypoints. Unguarded.
+#
+# Fixes over trajectory_unsafe_move_j.script:
+#
+#   1. Progress reporting no longer sits between the moves. The original emitted
+#      socket_send_line("waypoint_reached n") *between* two blended movej calls,
+#      and its own comment admits this may flush the controller's look-ahead and
+#      break the blend - which is why report_waypoint_progress exists as an
+#      escape hatch at all. Here the moves are one uninterrupted block and a
+#      separate thread watches the arm and reports each waypoint as it is passed.
+#      Blending is preserved *and* a paused trajectory can still be resumed where
+#      it stopped. The reported index and its meaning are unchanged, so
+#      socket_server's WAYPOINT_REACHED_PREFIX handling needs no change.
+#
+#   2. A waypoint whose target pose is the base origin is refused. When a
+#      waypoint sets use_relative_pose, command_server skips the transform lookup
+#      and leaves target_in_base at the identity pose - but Waypoint has no
+#      use_relative_pose field, so the template cannot tell and the original
+#      would happily movej to p[0,0,0,0,0,0], i.e. drive the tool into the middle
+#      of the robot's own base. No legitimate TCP target is ever within a
+#      millimetre of the base origin, so refusing it is safe. (The real fix is to
+#      add use_relative_pose to the Waypoint struct - see CLAUDE_TEMPLATES.md.)
+#
+#   3. Per-waypoint global_velocity_scaling / global_acceleration_scaling are
+#      applied. They were decoded per waypoint and then ignored.
+#
+#   4. A waypoint that is not the last one and has no blend radius is reported as
+#      a warning, since that is the usual cause of "this trajectory stops at
+#      every point".
+#
+# Optional parameters:
+#   check_safety_limits (true) - also check the target against the active safety
+#                                planes, joint limits and tool orientation limit,
+#                                not only whether inverse kinematics has a
+#                                solution. This is what catches a pose that is
+#                                reachable but would trip a protective stop.
+
+global cl_v = 0.0
+global cl_a = 0.0
+
+def cl_joint_dist(qa, qb):
+  local d = 0.0
+  local i = 0
+  local e = 0.0
+  while i < 6:
+    e = qa[i] - qb[i]
+    if e < 0.0:
+      e = -e
+    end
+    if e > d:
+      d = e
+    end
+    i = i + 1
+  end
+  return d
+end
+
+def script():
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  {%- if waypoints | length == 0 %}
+  socket_send_line("This is a trajectory command but no waypoints were given.", "ur_driver_socket")
+  return False
+  {%- endif %}
+
+  socket_send_line("Validating blended trajectory of {{ waypoints | length }} waypoints...", "ur_driver_socket")
+
+  # --- PHASE 1: everything that can be checked without moving ---
+  {%- for wp in waypoints %}
+  {%- if not wp.use_joint_positions %}
+  if point_dist({{ wp.target_in_base }}, p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) < 0.001:
+    socket_send_line("Waypoint {{ loop.index0 }} has an unset target (base origin). Refusing to move there.", "ur_driver_socket")
+    return False
+  end
+  if not get_inverse_kin_has_solution({{ wp.target_in_base }}
+    {%- if wp.use_preferred_joint_config -%}
+    , qnear={{ wp.preferred_joint_config }}
+    {%- endif -%}):
+    socket_send_line("No inverse kinematics solution for waypoint {{ loop.index0 }}, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits({{ wp.target_in_base }}):
+    socket_send_line("Waypoint {{ loop.index0 }} is outside the active safety limits, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+  {%- endif %}
+  {%- if not wp.use_blend_radius and not loop.last %}
+  socket_send_line("Waypoint {{ loop.index0 }} has no blend radius, the arm will come to a stop there.", "ur_driver_socket")
+  {%- endif %}
+  {%- endfor %}
+
+  socket_send_line("Validation passed. Starting continuous motion.", "ur_driver_socket")
+
+  {%- if report_waypoint_progress %}
+  # Progress is watched from a thread so that nothing is written to the socket in
+  # between two blended moves. Each waypoint is reported once the arm is inside a
+  # tolerance derived from its own blend radius - with blending the arm cuts the
+  # corner and never reaches the waypoint exactly, so the tolerance has to be at
+  # least the blend radius.
+  thread progress_thread():
+    {%- for wp in waypoints %}
+    {%- if wp.use_joint_positions %}
+    while cl_joint_dist(get_actual_joint_positions(), {{ wp.joint_positions }}) > {% if wp.use_blend_radius %}0.08{% else %}0.02{% endif %}:
+      sleep(0.004)
+    end
+    {%- else %}
+    while point_dist(get_actual_tcp_pose(), {{ wp.target_in_base }}) > {% if wp.use_blend_radius %}{{ wp.blend_radius * 1.5 + 0.005 | round(precision=4) }}{% else %}0.005{% endif %}:
+      sleep(0.004)
+    end
+    {%- endif %}
+    socket_send_line("waypoint_reached {{ loop.index0 }}", "ur_driver_socket")
+    {%- endfor %}
+  end
+  t_progress = run progress_thread()
+  {%- endif %}
+
+  # --- PHASE 2: one uninterrupted block of moves, so the blends survive ---
+  {%- for wp in waypoints %}
+  cl_v = {{ wp.velocity }}
+  cl_a = {{ wp.acceleration }}
+  if {{ wp.global_velocity_scaling }} > 0.0 and {{ wp.global_velocity_scaling }} <= 1.0:
+    cl_v = cl_v * {{ wp.global_velocity_scaling }}
+  end
+  if {{ wp.global_acceleration_scaling }} > 0.0 and {{ wp.global_acceleration_scaling }} <= 1.0:
+    cl_a = cl_a * {{ wp.global_acceleration_scaling }}
+  end
+  {%- if wp.use_joint_positions %}
+  movej({{ wp.joint_positions }}, a=cl_a, v=cl_v
+  {%- if wp.use_execution_time -%}
+  , t={{ wp.execution_time }}
+  {%- endif -%}
+  {%- if wp.use_blend_radius -%}
+  , r={{ wp.blend_radius }}
+  {%- endif -%})
+  {%- else %}
+  movej(get_inverse_kin({{ wp.target_in_base }}
+    {%- if wp.use_preferred_joint_config -%}
+    , qnear={{ wp.preferred_joint_config }}
+    {%- endif -%})
+  , a=cl_a, v=cl_v
+  {%- if wp.use_execution_time -%}
+  , t={{ wp.execution_time }}
+  {%- endif -%}
+  {%- if wp.use_blend_radius -%}
+  , r={{ wp.blend_radius }}
+  {%- endif -%})
+  {%- endif %}
+  {%- endfor %}
+
+  # movej/movel block until the arm reaches the waypoint, so by here the whole
+  # path has been executed. The short sleep only gives the progress thread time
+  # to publish the last waypoint before it is killed.
+  {%- if report_waypoint_progress %}
+  sleep(0.05)
+  kill t_progress
+  {%- endif %}
+  return True
+end

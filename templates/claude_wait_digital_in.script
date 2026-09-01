@@ -1,0 +1,52 @@
+# claude_wait_digital_in
+#
+# New template. Blocks until a digital input reaches a state, or until a timeout.
+#
+# There was no way to make the robot wait on the cell - a fixture clamping, a
+# conveyor stopping, a vacuum switch confirming a part is really held. Without it
+# the only options are to poll from Redis, which costs a round trip per check, or
+# to sleep for a guessed duration.
+#
+# Returns True when the input reached the wanted state and False on timeout, so a
+# timeout becomes a failed request with a reason rather than a silent continue.
+#
+# Optional parameters:
+#   din_bank    ("standard") - "standard", "configurable" or "tool".
+#   din_pin     (0)
+#   din_value   (true)       - the state to wait for.
+#   din_timeout (10.0)       - seconds, approximate: URScript has no wall clock,
+#                              so the wait is counted in sleep(0.01) ticks and
+#                              runs a few percent long. 0 or less waits forever,
+#                              which holds the goal open until it is cancelled.
+
+{%- set bank = din_bank | default(value="standard") %}
+{%- set pin = din_pin | default(value=0) %}
+{%- if bank == "tool" %}{% set getter = "get_tool_digital_in" %}
+{%- elif bank == "configurable" %}{% set getter = "get_configurable_digital_in" %}
+{%- else %}{% set getter = "get_standard_digital_in" %}
+{%- endif %}
+
+global cl_waited = 0.0
+
+def script():
+  cl_waited = 0.0
+  while True:
+    {%- if din_value | default(value=true) %}
+    if {{ getter }}({{ pin }}):
+    {%- else %}
+    if not {{ getter }}({{ pin }}):
+    {%- endif %}
+      socket_send_line("{{ bank }} DI {{ pin }} reached the wanted state after " + to_str(cl_waited) + "s", "ur_driver_socket")
+      return True
+    end
+    {%- if din_timeout | default(value=10.0) > 0.0 %}
+    if cl_waited >= {{ din_timeout | default(value=10.0) }}:
+      socket_send_line("timed out after {{ din_timeout | default(value=10.0) }}s waiting for {{ bank }} DI {{ pin }}", "ur_driver_socket")
+      return False
+    end
+    {%- endif %}
+    sleep(0.01)
+    cl_waited = cl_waited + 0.01
+  end
+  return False
+end

@@ -1,0 +1,128 @@
+# claude_safe_move_l
+#
+# movel to an absolute base-frame pose with a force guard. See the header of
+# claude_safe_move_j.script for the full list of fixes; the ones specific to this
+# template are:
+#
+#   * The payload was set twice in safe_move_l.script, once in script() and once
+#     again inside move_thread(). Setting a payload while the arm is about to
+#     move is exactly when it matters that it is set once, at standstill.
+#   * set_tcp() moved out of the move thread. It is a configuration call, not a
+#     motion call, and running it in the thread races the force monitor that is
+#     already sampling get_tcp_force() through that same TCP.
+#   * stopl() instead of stopj() to decelerate a linear move, so the tool keeps
+#     following its line while it brakes instead of taking a joint-space path.
+#   * The target is checked for reachability before the guard is armed.
+#
+# Optional parameters: use_zero_ftsensor (true), force_settle_time (0.3),
+# stop_acceleration (1.5, m/s^2 here because it is a linear stop).
+#   check_safety_limits (true) - also check the target against the active safety
+#                                planes, joint limits and tool orientation limit,
+#                                not only whether inverse kinematics has a
+#                                solution. This is what catches a pose that is
+#                                reachable but would trip a protective stop.
+
+global cl_move_done = False
+global cl_force_detected = False
+global cl_vel = 0.0
+global cl_acc = 0.0
+global cl_threshold = 0.0
+global cl_settle = 0.0
+global cl_base_f = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+global cl_peak = 0.0
+
+def script():
+  cl_move_done = False
+  cl_force_detected = False
+  cl_peak = 0.0
+  cl_threshold = {{ force_threshold }}
+  cl_settle = {{ force_settle_time | default(value=0.3) }}
+
+  cl_vel = {{ velocity }}
+  cl_acc = {{ acceleration }}
+  if {{ global_velocity_scaling }} > 0.0 and {{ global_velocity_scaling }} <= 1.0:
+    cl_vel = cl_vel * {{ global_velocity_scaling }}
+  end
+  if {{ global_acceleration_scaling }} > 0.0 and {{ global_acceleration_scaling }} <= 1.0:
+    cl_acc = cl_acc * {{ global_acceleration_scaling }}
+  end
+
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  if not get_inverse_kin_has_solution({{ target_in_base }}
+  {%- if use_preferred_joint_config -%}
+  , qnear={{ preferred_joint_config }}
+  {%- endif -%}):
+    socket_send_line("Target pose is not reachable, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits({{ target_in_base }}):
+    socket_send_line("Target pose is outside the active safety limits, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+
+  if cl_threshold > 0.0:
+    {%- if use_zero_ftsensor | default(value=true) %}
+    zero_ftsensor()
+    {%- endif %}
+    sleep(0.1)
+    cl_base_f = get_tcp_force()
+  else:
+    socket_send_line("force_threshold is 0, force monitoring is disabled for this move.", "ur_driver_socket")
+  end
+
+  thread move_thread():
+    movel({{ target_in_base }}, a=cl_acc, v=cl_vel
+    {%- if use_execution_time -%}
+    , t={{ execution_time }}
+    {%- endif -%}
+    {%- if use_blend_radius -%}
+    , r={{ blend_radius }}
+    {%- endif -%})
+    cl_move_done = True
+  end
+
+  thread force_monitor_thread():
+    if cl_threshold > 0.0:
+      sleep(cl_settle)
+      while not cl_move_done:
+        w = get_tcp_force()
+        dx = w[0] - cl_base_f[0]
+        dy = w[1] - cl_base_f[1]
+        dz = w[2] - cl_base_f[2]
+        mag = sqrt(dx * dx + dy * dy + dz * dz)
+        if mag > cl_peak:
+          cl_peak = mag
+        end
+        if mag > cl_threshold:
+          cl_force_detected = True
+          break
+        end
+        sleep(0.002)
+      end
+    end
+  end
+
+  t_move = run move_thread()
+  t_force = run force_monitor_thread()
+
+  while not cl_move_done and not cl_force_detected:
+    sleep(0.002)
+  end
+
+  kill t_move
+  kill t_force
+  stopl({{ stop_acceleration | default(value=1.5) }})
+  sleep(0.5)
+
+  if cl_force_detected:
+    socket_send_line("force_stop peak=" + to_str(cl_peak) + "N threshold=" + to_str(cl_threshold) + "N", "ur_driver_socket")
+    return False
+  end
+  return cl_move_done
+end

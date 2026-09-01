@@ -1,0 +1,138 @@
+# claude_move_until_contact
+#
+# New template. Moves along a tool-frame direction until something is touched,
+# and reports where that happened.
+#
+# The safe_move templates treat contact as a failure - they stop and the request
+# aborts. Touching a surface on purpose is the opposite: it is how you find the
+# top of a stack whose height you do not know, seat a part against a fixture, or
+# measure a workpiece. Without this, the only way to express "go down until you
+# feel the table" is to send a safe_move and read its failure as a success, which
+# loses the one number you actually wanted - the pose at contact.
+#
+# relative_pose is the search vector in the current TCP frame: direction and
+# maximum distance. force_threshold is the contact force in newtons and must be
+# greater than zero - a search with no trigger is just a move.
+#
+# Returns True on contact, and the contact pose goes out on the socket as
+# "CONTACT pose=... q=... force=...". Travelling the whole distance without
+# touching anything returns False unless require_contact is set false.
+#
+# Optional parameters: use_zero_ftsensor (true), force_settle_time (0.3),
+# stop_acceleration (1.5), require_contact (true).
+#   check_safety_limits (true) - also check the target against the active safety
+#                                planes, joint limits and tool orientation limit,
+#                                not only whether inverse kinematics has a
+#                                solution. This is what catches a pose that is
+#                                reachable but would trip a protective stop.
+
+global cl_move_done = False
+global cl_force_detected = False
+global cl_vel = 0.0
+global cl_acc = 0.0
+global cl_threshold = 0.0
+global cl_settle = 0.0
+global cl_base_f = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+global cl_peak = 0.0
+global cl_target = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+def script():
+  cl_move_done = False
+  cl_force_detected = False
+  cl_peak = 0.0
+  cl_threshold = {{ force_threshold }}
+  cl_settle = {{ force_settle_time | default(value=0.3) }}
+
+  if cl_threshold <= 0.0:
+    socket_send_line("force_threshold must be greater than 0 for a contact search.", "ur_driver_socket")
+    return False
+  end
+
+  # A search is a slow move by nature. Anything the caller sends is capped, since
+  # the whole point is to stop within a few millimetres of first touch.
+  cl_vel = {{ velocity }}
+  cl_acc = {{ acceleration }}
+  if {{ global_velocity_scaling }} > 0.0 and {{ global_velocity_scaling }} <= 1.0:
+    cl_vel = cl_vel * {{ global_velocity_scaling }}
+  end
+  if {{ global_acceleration_scaling }} > 0.0 and {{ global_acceleration_scaling }} <= 1.0:
+    cl_acc = cl_acc * {{ global_acceleration_scaling }}
+  end
+  if cl_vel <= 0.0 or cl_vel > {{ search_max_velocity | default(value=0.05) }}:
+    cl_vel = {{ search_max_velocity | default(value=0.05) }}
+  end
+  if cl_acc <= 0.0 or cl_acc > {{ search_max_acceleration | default(value=0.3) }}:
+    cl_acc = {{ search_max_acceleration | default(value=0.3) }}
+  end
+
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  cl_target = pose_trans(get_forward_kin(), p{{ relative_pose }})
+  if not get_inverse_kin_has_solution(cl_target):
+    socket_send_line("The far end of the search path is not reachable, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits(cl_target):
+    socket_send_line("The far end of the search path is outside the active safety limits, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+
+  {%- if use_zero_ftsensor | default(value=true) %}
+  zero_ftsensor()
+  {%- endif %}
+  sleep(0.1)
+  cl_base_f = get_tcp_force()
+
+  thread move_thread():
+    movel(cl_target, a=cl_acc, v=cl_vel)
+    cl_move_done = True
+  end
+
+  thread force_monitor_thread():
+    sleep(cl_settle)
+    while not cl_move_done:
+      w = get_tcp_force()
+      dx = w[0] - cl_base_f[0]
+      dy = w[1] - cl_base_f[1]
+      dz = w[2] - cl_base_f[2]
+      mag = sqrt(dx * dx + dy * dy + dz * dz)
+      if mag > cl_peak:
+        cl_peak = mag
+      end
+      if mag > cl_threshold:
+        cl_force_detected = True
+        break
+      end
+      sleep(0.002)
+    end
+  end
+
+  t_move = run move_thread()
+  t_force = run force_monitor_thread()
+
+  while not cl_move_done and not cl_force_detected:
+    sleep(0.002)
+  end
+
+  kill t_move
+  kill t_force
+  stopl({{ stop_acceleration | default(value=1.5) }})
+  sleep(0.3)
+
+  if cl_force_detected:
+    socket_send_line("CONTACT pose=" + to_str(get_actual_tcp_pose()) + " q=" + to_str(get_actual_joint_positions()) + " force=" + to_str(cl_peak), "ur_driver_socket")
+    return True
+  end
+
+  socket_send_line("NO_CONTACT travelled the full search distance, peak force " + to_str(cl_peak) + "N", "ur_driver_socket")
+  {%- if require_contact | default(value=true) %}
+  return False
+  {%- else %}
+  return True
+  {%- endif %}
+end

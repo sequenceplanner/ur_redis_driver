@@ -1,0 +1,23 @@
+# claude_stop
+#
+# New template. Brings the arm to a controlled stop.
+#
+# Sending anything to port 30003 already replaces whatever script is running, so
+# this stops the previous motion by existing at all - but it replaces it with
+# nothing, and the arm coasts to a halt on the controller's own deceleration.
+# This decelerates deliberately, at a rate the caller chooses, which is what you
+# want for a soft abort that is not a protective stop.
+#
+# This is not a replacement for the dashboard `stop` that handle_request uses to
+# cancel a goal: that one is out of band and works even when a script is wedged.
+# This one is a normal request and is subject to the same admission control as
+# any other, so it will be rejected while another goal is running.
+#
+# Optional parameters:
+#   stop_acceleration (2.0) - rad/s^2.
+
+def script():
+  stopj({{ stop_acceleration | default(value=2.0) }})
+  socket_send_line("stopped, q=" + to_str(get_actual_joint_positions()), "ur_driver_socket")
+  return True
+end

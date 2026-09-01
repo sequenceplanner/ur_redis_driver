@@ -1,0 +1,45 @@
+# claude_set_payload
+#
+# Same as set_payload.script, plus a standstill check.
+#
+# set_target_payload() changes the model the controller uses for gravity
+# compensation. Changing it while the arm is moving steps the internal force
+# estimate, which on a tight safety setup is enough to trip a protective stop.
+# The template refuses rather than doing that.
+#
+# Note the naming trap: Payload::to_string() in the driver emits
+# "mass,[cog],[inertia]" - three arguments. set_payload() only takes two
+# (mass, cog), so pick_vacuum.script's `set_payload({{ payload }})` is a runtime
+# error on the controller. set_target_payload() is the one that matches.
+#
+# Optional parameters:
+#   steady_timeout      (1.0)  - seconds to wait for the arm to reach standstill
+#                                before refusing. is_steady() needs 500ms of
+#                                stillness, so a single check would fail a script
+#                                that starts right after the previous one.
+
+def cl_wait_steady(timeout):
+  # is_steady() only turns true after 500ms of standstill with zero target
+  # velocity, so a script that starts right after the previous one finished
+  # braking sees false for up to half a second. Checking it once would fail
+  # perfectly good requests; this waits for it instead.
+  local waited = 0.0
+  while not is_steady():
+    if waited >= timeout:
+      return False
+    end
+    sleep(0.02)
+    waited = waited + 0.02
+  end
+  return True
+end
+
+def script():
+  if not cl_wait_steady({{ steady_timeout | default(value=1.0) }}):
+    socket_send_line("The arm did not come to a standstill, refusing to change the payload.", "ur_driver_socket")
+    return False
+  end
+  set_target_payload({{ payload }})
+  socket_send_line("payload set to {{ payload }}", "ur_driver_socket")
+  return True
+end

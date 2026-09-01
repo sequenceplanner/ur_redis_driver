@@ -1,0 +1,59 @@
+# claude_home
+#
+# New template. Drives the arm to a known joint configuration at a deliberately
+# conservative speed.
+#
+# The driver already has a home in it - SAFE_HOME_JOINT_STATE in command_server -
+# and command_server falls back to it whenever joint_positions is missing or
+# malformed. But there is no command that goes there, so recovering a cell after
+# an abort means a caller has to know those six numbers and issue a move_j. This
+# is that command: send it with no joint_positions and the driver's own fallback
+# takes over.
+#
+# Caps velocity and acceleration rather than trusting the request, because this
+# is the command that gets used when something has already gone wrong and nobody
+# is confident about where the arm is.
+#
+# Optional parameters:
+#   home_max_velocity     (0.5) - rad/s, upper bound on the leading joint.
+#   home_max_acceleration (1.0) - rad/s^2.
+#   check_safety_limits (true) - also check the target against the active safety
+#                                planes, joint limits and tool orientation limit,
+#                                not only whether inverse kinematics has a
+#                                solution. This is what catches a pose that is
+#                                reachable but would trip a protective stop.
+
+global cl_vel = 0.0
+global cl_acc = 0.0
+
+def script():
+  cl_vel = {{ velocity }}
+  cl_acc = {{ acceleration }}
+  if {{ global_velocity_scaling }} > 0.0 and {{ global_velocity_scaling }} <= 1.0:
+    cl_vel = cl_vel * {{ global_velocity_scaling }}
+  end
+  if {{ global_acceleration_scaling }} > 0.0 and {{ global_acceleration_scaling }} <= 1.0:
+    cl_acc = cl_acc * {{ global_acceleration_scaling }}
+  end
+  if cl_vel <= 0.0 or cl_vel > {{ home_max_velocity | default(value=0.5) }}:
+    cl_vel = {{ home_max_velocity | default(value=0.5) }}
+  end
+  if cl_acc <= 0.0 or cl_acc > {{ home_max_acceleration | default(value=1.0) }}:
+    cl_acc = {{ home_max_acceleration | default(value=1.0) }}
+  end
+
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits({{ joint_positions }}):
+    socket_send_line("The home configuration is outside the active safety limits, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+  socket_send_line("homing to " + to_str({{ joint_positions }}) + " at v=" + to_str(cl_vel), "ur_driver_socket")
+  movej({{ joint_positions }}, a=cl_acc, v=cl_vel)
+  return True
+end

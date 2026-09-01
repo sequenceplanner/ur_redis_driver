@@ -79,6 +79,7 @@ dashboard `stop`.
 | `r1_tcp_id` | string | TCP frame; looked up against `faceplate_id` |
 | `r1_force_threshold` | float | Force guard for the `safe_*` templates |
 | `r1_waypoints` | array of maps | Blended trajectory, see below |
+| `r1_trajectory_id` | string | Name of a stored trajectory to run, without `.json`. Empty means "plan from `r1_waypoints`". Only read by `optimal_trajectory` |
 | `r1_report_waypoint_progress` | bool | Default true. Trajectory templates report each waypoint reached, so a paused trajectory can resume mid-path. See Pause and resume |
 | `r1_request_feedback` | string | Latest line the running script sent back |
 | `r1_total_fail_counter` | int | Cumulative failures, never reset |
@@ -88,17 +89,102 @@ Available `command_type` values are exactly the filenames in `templates/`:
 `safe_move_j`, `safe_move_l`, `safe_move_l_relative`, `unsafe_move_j`,
 `unsafe_move_l`, `unsafe_move_l_relative`, `trajectory_unsafe_move_j`,
 `trajectory_unsafe_move_l`, `pick_vacuum`, `place_vacuum`, `start_vacuum`,
-`stop_vacuum`, `lock_rsp`, `unlock_rsp`, `set_payload`, `get_force`. An
-unrecognised name fails the request. Adding a template adds a command; any field
-it references must exist on `RobotCommand` in `src/core/structs.rs`.
+`stop_vacuum`, `lock_rsp`, `unlock_rsp`, `set_payload`, `get_force`,
+`optimal_trajectory`. An unrecognised name fails the request. Adding a template
+adds a command; any field it references must exist on `RobotCommand` in
+`src/core/structs.rs`.
 
 `r1_waypoints` is an array of maps carrying the same per-point fields as above,
-plus `use_relative_pose`, `baseframe_id`, `faceplate_id`, `goal_feature_id`,
-`tcp_id` and `root_frame_id`. A waypoint that fails to decode fails the whole
-request — a blended trajectory with a point missing is a different path, not a
-shorter one.
+plus `use_relative_pose`, `use_linear_motion`, `baseframe_id`, `faceplate_id`,
+`goal_feature_id`, `tcp_id` and `root_frame_id`. A waypoint that fails to decode
+fails the whole request — a blended trajectory with a point missing is a different
+path, not a shorter one. `use_linear_motion` is optional and defaults to false;
+unlike every other field, a missing key does not fail the request, so waypoint
+publishers written before it existed keep working.
+
+`use_linear_motion` says how the arm *travels* to a waypoint — `movel` (a straight
+tool path) rather than `movej` — which is independent of `use_joint_positions`,
+which says how the *target* is specified. `movel` accepts a joint vector and moves
+to its forward kinematics in a straight line.
 
 Only one goal runs at a time; a second request is rejected while one is active.
+
+## Planned trajectories
+
+`optimal_trajectory` runs a path whose speed is chosen per segment rather than once
+for the whole motion.
+
+Every other command takes a single `velocity` and `acceleration`, so they have to be
+conservative enough for the worst segment of the path and every other segment runs
+below what its joints allow. `movej`'s `v` is the speed of the *leading axis* and
+the controller scales the rest to start and stop together, so the fastest legal
+speed for a segment is
+
+```
+dmax = max_j |dq_j|
+v*   = min over moving joints i of ( vmax_i * dmax / |dq_i| )
+```
+
+which is tight: some joint ends up exactly on its limit. On a UR20 a wrist-led
+segment gets 3.67 rad/s where a shoulder-led one gets 2.09, so a mixed path that
+used to run entirely at 2.09 now runs each segment at its own limit.
+
+The planner also solves inverse kinematics **in Rust**, against the same URDF the
+driver loads, so a planned script contains no `get_inverse_kin` at all. Poses are
+resolved to the branch nearest the previous waypoint, which is what stops a
+trajectory flipping its wrist halfway through, and an unreachable point becomes a
+request failure with a reason instead of a script that aborts on the pendant.
+
+Two ways to use it.
+
+**Plan at request time.** Publish waypoints as usual and set the command type:
+
+```
+r1_command_type  = "optimal_trajectory"
+r1_trajectory_id = ""            # empty: plan from r1_waypoints
+r1_waypoints     = [ ... ]       # the arm's current position is the start
+```
+
+**Plan offline, run later.** Plan once, review the script, then run it by name:
+
+```bash
+cargo run --bin plan_trajectory -- plan --input docs/example_path.json --name pick_approach
+cargo run --bin plan_trajectory -- render pick_approach       # the URScript it will send
+cargo run --bin plan_trajectory -- list
+```
+
+```
+r1_command_type  = "optimal_trajectory"
+r1_trajectory_id = "pick_approach"
+```
+
+Trajectories are JSON files under `UR_TRAJECTORY_DIR` (default `trajectories/`), and
+each keeps the request it came from so it can be re-planned when limits change. A
+stored trajectory is checked against the arm's current position before it runs: it
+was planned from a specific start, and a blended path started from somewhere else is
+a different path. `plan_trajectory --help` documents the input file.
+
+### What it does not do
+
+- **No collision checking**, of the arm against itself or against the cell. The
+  script still checks every waypoint with `is_within_safety_limits()`, which covers
+  safety planes and the tool orientation limit, but nothing checks the path
+  *between* waypoints.
+- **Acceleration limits are estimates.** UR does not publish them — every
+  `joint_limits.yaml` says `has_acceleration_limits: false` — so each joint is
+  assumed to reach its maximum velocity in 0.5 s, and `acceleration` scaling
+  defaults to **0.5** on top of that. Override per joint with
+  `--acceleration-limits`. Raising them is an empirical exercise.
+- **It never sets `t=`.** Execution time overrides `a` and `v` and is unbounded, so
+  a duration the joints cannot meet faults rather than saturating.
+- **It is not a time-optimal path parameterisation.** Blending merges one move's
+  deceleration into the next move's acceleration and the controller picks that
+  junction speed itself, so a TOPP profile would be re-timed before it executed.
+  Per-segment `v*`/`a*` is what is both optimal and commandable through blended
+  `movej`. Executing a true TOPP profile would need an unrolled `servoj` block.
+- **Nothing here has been run on a robot.** `cargo test` covers the kinematics
+  against the URDF and the planner against the joint limits; the blend behaviour
+  and the timing estimate want URSim before the real arm.
 
 ## Dashboard requests
 
@@ -250,3 +336,8 @@ driver's own scripts.
 - The gripper interface (`generate_gripper_interface_state`) is written but not
   wired up.
 - Digital outputs cannot be set from Redis.
+- Planned trajectories have not been run on a robot. In particular the
+  "Overlapping Blends" rule is not documented by UR — the planner keeps each blend
+  radius under 0.4 of the shorter adjacent chord, which is inferred rather than
+  read — and the interaction of blending with the estimated durations wants
+  measuring in URSim.

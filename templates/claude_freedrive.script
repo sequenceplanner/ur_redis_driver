@@ -1,0 +1,74 @@
+# claude_freedrive
+#
+# New template. Puts the arm in freedrive for a bounded time, then takes it out
+# again.
+#
+# In remote control the pendant's freedrive button is not available, so there is
+# no way to hand the arm to an operator to be positioned - which is exactly what
+# teaching a new frame needs. The duration is bounded and the script leaves
+# freedrive on its own, so an operator walking away does not leave the arm
+# limp indefinitely.
+#
+# The payload must be right before this runs. Freedrive with a wrong payload
+# means the arm drifts under gravity as soon as it is released.
+#
+# Duration comes from execution_time when use_execution_time is set, otherwise
+# from freedrive_time.
+#
+# Optional parameters:
+#   freedrive_time     (10.0) - seconds.
+#   freedrive_max_time (120.0)
+#   steady_timeout      (1.0)  - seconds to wait for the arm to reach standstill
+#                                before refusing. is_steady() needs 500ms of
+#                                stillness, so a single check would fail a script
+#                                that starts right after the previous one.
+
+global cl_duration = 0.0
+
+def cl_wait_steady(timeout):
+  # is_steady() only turns true after 500ms of standstill with zero target
+  # velocity, so a script that starts right after the previous one finished
+  # braking sees false for up to half a second. Checking it once would fail
+  # perfectly good requests; this waits for it instead.
+  local waited = 0.0
+  while not is_steady():
+    if waited >= timeout:
+      return False
+    end
+    sleep(0.02)
+    waited = waited + 0.02
+  end
+  return True
+end
+
+def script():
+  {%- if use_execution_time %}
+  cl_duration = {{ execution_time }}
+  {%- else %}
+  cl_duration = {{ freedrive_time | default(value=10.0) }}
+  {%- endif %}
+  if cl_duration <= 0.0:
+    cl_duration = {{ freedrive_time | default(value=10.0) }}
+  end
+  if cl_duration > {{ freedrive_max_time | default(value=120.0) }}:
+    cl_duration = {{ freedrive_max_time | default(value=120.0) }}
+  end
+
+  if not cl_wait_steady({{ steady_timeout | default(value=1.0) }}):
+    socket_send_line("The arm did not come to a standstill, refusing to enter freedrive.", "ur_driver_socket")
+    return False
+  end
+
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  socket_send_line("freedrive on for " + to_str(cl_duration) + "s", "ur_driver_socket")
+  freedrive_mode()
+  sleep(cl_duration)
+  end_freedrive_mode()
+  sleep(0.2)
+  socket_send_line("freedrive off, tcp=" + to_str(get_actual_tcp_pose()) + " q=" + to_str(get_actual_joint_positions()), "ur_driver_socket")
+  return True
+end

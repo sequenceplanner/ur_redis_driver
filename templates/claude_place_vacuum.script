@@ -1,0 +1,230 @@
+# claude_place_vacuum
+#
+# Descends until the part touches down, releases the vacuum, and retracts.
+#
+# Fixes over place_vacuum.script:
+#
+#   1. set_tcp() and the payload were commented out, so the place ran with
+#      whatever TCP the previous script happened to leave active and with the
+#      controller still modelling the part as part of the payload. A place is the
+#      one move where the payload is *about* to change, so it matters twice.
+#
+#   2. The descent was hard-coded to p[0,0,0.2,0,0,0] at a=0.1, v=0.05 while the
+#      retract used {{ acceleration }} and {{ velocity }}. Both halves now use
+#      relative_pose and the request's speeds.
+#
+#   3. force_threshold = 0.0 released the part on the first sample - i.e. dropped
+#      it from wherever the arm happened to be. That is now refused.
+#
+#   4. The guard is a delta from a baseline sampled at standstill, so the weight
+#      of the part on the cup is not mistaken for touchdown.
+#
+#   5. Reaching the end of the descent without touching down used to release the
+#      part anyway and return True - a drop from full approach height reported as
+#      a successful place. It now fails with the part still held.
+#
+#   6. The payload is cleared after the release, so the arm does not carry a
+#      model of a part it no longer has.
+#
+#   7. The retract is force-guarded. The original retracted blind, and a part
+#      still stuck to the cup is exactly what that move needs to catch.
+#
+# Optional parameters:
+#   vacuum_pin        (0)
+#   vacuum_ok_pin     (-1)   - standard DI from the vacuum switch. When set, the
+#                              release is verified instead of assumed.
+#   release_dwell     (0.3)  - seconds to let the vacuum decay before retracting.
+#   blow_off_pin      (-1)   - standard DO pulsed to shake the part loose.
+#   blow_off_time     (0.0)
+#   retract_distance  (0.1)  - m along tool -Z.
+#   clear_payload_after_place (true)
+#   use_zero_ftsensor (true), force_settle_time (0.3), stop_acceleration (1.5)
+#   check_safety_limits (true) - also check the target against the active safety
+#                                planes, joint limits and tool orientation limit,
+#                                not only whether inverse kinematics has a
+#                                solution. This is what catches a pose that is
+#                                reachable but would trip a protective stop.
+
+global cl_move_done = False
+global cl_force_detected = False
+global cl_vel = 0.0
+global cl_acc = 0.0
+global cl_threshold = 0.0
+global cl_settle = 0.0
+global cl_base_f = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+global cl_peak = 0.0
+global cl_target = p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+def script():
+  cl_threshold = {{ force_threshold }}
+  cl_settle = {{ force_settle_time | default(value=0.3) }}
+  if cl_threshold <= 0.0:
+    socket_send_line("force_threshold must be greater than 0 for a vacuum place.", "ur_driver_socket")
+    return False
+  end
+
+  cl_vel = {{ velocity }}
+  cl_acc = {{ acceleration }}
+  if {{ global_velocity_scaling }} > 0.0 and {{ global_velocity_scaling }} <= 1.0:
+    cl_vel = cl_vel * {{ global_velocity_scaling }}
+  end
+  if {{ global_acceleration_scaling }} > 0.0 and {{ global_acceleration_scaling }} <= 1.0:
+    cl_acc = cl_acc * {{ global_acceleration_scaling }}
+  end
+
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  # ---------- descend until the part touches down ----------
+  cl_move_done = False
+  cl_force_detected = False
+  cl_peak = 0.0
+  cl_target = pose_trans(get_forward_kin(), p{{ relative_pose }})
+  if not get_inverse_kin_has_solution(cl_target):
+    socket_send_line("The bottom of the place approach is not reachable, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits(cl_target):
+    socket_send_line("The bottom of the place approach is outside the active safety limits, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+
+  {%- if use_zero_ftsensor | default(value=true) %}
+  zero_ftsensor()
+  {%- endif %}
+  sleep(0.1)
+  cl_base_f = get_tcp_force()
+
+  thread move_down_thread():
+    movel(cl_target, a=cl_acc, v=cl_vel)
+    cl_move_done = True
+  end
+
+  thread force_monitor_down_thread():
+    sleep(cl_settle)
+    while not cl_move_done:
+      w = get_tcp_force()
+      dx = w[0] - cl_base_f[0]
+      dy = w[1] - cl_base_f[1]
+      dz = w[2] - cl_base_f[2]
+      mag = sqrt(dx * dx + dy * dy + dz * dz)
+      if mag > cl_peak:
+        cl_peak = mag
+      end
+      if mag > cl_threshold:
+        cl_force_detected = True
+        break
+      end
+      sleep(0.002)
+    end
+  end
+
+  t_move_down = run move_down_thread()
+  t_force_down = run force_monitor_down_thread()
+
+  while not cl_move_done and not cl_force_detected:
+    sleep(0.002)
+  end
+
+  kill t_move_down
+  kill t_force_down
+  stopl({{ stop_acceleration | default(value=1.5) }})
+  sleep(0.2)
+
+  if not cl_force_detected:
+    socket_send_line("Reached the end of the approach without touching down. Not releasing.", "ur_driver_socket")
+    return False
+  end
+
+  # ---------- release ----------
+  set_standard_digital_out({{ vacuum_pin | default(value=0) }}, False)
+  {%- if blow_off_pin | default(value=-1) >= 0 and blow_off_time | default(value=0.0) > 0.0 %}
+  set_standard_digital_out({{ blow_off_pin | default(value=-1) }}, True)
+  sleep({{ blow_off_time | default(value=0.0) }})
+  set_standard_digital_out({{ blow_off_pin | default(value=-1) }}, False)
+  {%- endif %}
+  sleep({{ release_dwell | default(value=0.3) }})
+
+  {%- if vacuum_ok_pin | default(value=-1) >= 0 %}
+  if get_standard_digital_in({{ vacuum_ok_pin | default(value=-1) }}):
+    socket_send_line("The vacuum switch still reports a part after the release.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+
+  {%- if clear_payload_after_place | default(value=true) %}
+  # The part is no longer on the tool. Leaving it in the payload model makes the
+  # arm push against gravity it is not carrying, and skews every force reading
+  # after this.
+  set_target_payload({{ tool_only_payload | default(value="0.0,[0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0]") }})
+  {%- endif %}
+
+  socket_send_line("released at " + to_str(get_actual_tcp_pose()), "ur_driver_socket")
+
+  # ---------- retract, guarded in case the part came with us ----------
+  cl_move_done = False
+  cl_force_detected = False
+  cl_peak = 0.0
+  cl_target = pose_trans(get_forward_kin(), p[0.0, 0.0, -{{ retract_distance | default(value=0.1) }}, 0.0, 0.0, 0.0])
+  if not get_inverse_kin_has_solution(cl_target):
+    socket_send_line("The retract target is not reachable.", "ur_driver_socket")
+    return False
+  end
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits(cl_target):
+    socket_send_line("The retract target is outside the active safety limits.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+
+  sleep(0.1)
+  cl_base_f = get_tcp_force()
+
+  thread move_up_thread():
+    movel(cl_target, a=cl_acc, v=cl_vel)
+    cl_move_done = True
+  end
+
+  thread force_monitor_up_thread():
+    sleep(cl_settle)
+    while not cl_move_done:
+      w = get_tcp_force()
+      dx = w[0] - cl_base_f[0]
+      dy = w[1] - cl_base_f[1]
+      dz = w[2] - cl_base_f[2]
+      mag = sqrt(dx * dx + dy * dy + dz * dz)
+      if mag > cl_peak:
+        cl_peak = mag
+      end
+      if mag > cl_threshold:
+        cl_force_detected = True
+        break
+      end
+      sleep(0.002)
+    end
+  end
+
+  t_move_up = run move_up_thread()
+  t_force_up = run force_monitor_up_thread()
+
+  while not cl_move_done and not cl_force_detected:
+    sleep(0.002)
+  end
+
+  kill t_move_up
+  kill t_force_up
+  stopl({{ stop_acceleration | default(value=1.5) }})
+  sleep(0.3)
+
+  if cl_force_detected:
+    socket_send_line("Resistance on the way up after the release, peak " + to_str(cl_peak) + "N. The part may still be on the cup.", "ur_driver_socket")
+    return False
+  end
+
+  socket_send_line("place complete at " + to_str(get_actual_tcp_pose()), "ur_driver_socket")
+  return True
+end

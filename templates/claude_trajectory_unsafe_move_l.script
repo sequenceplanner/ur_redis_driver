@@ -1,0 +1,119 @@
+# claude_trajectory_unsafe_move_l
+#
+# A blended sequence of movel waypoints. Unguarded.
+#
+# Same fixes as claude_trajectory_unsafe_move_j.script - read that header for the
+# reasoning. In short: progress is reported from a watcher thread instead of from
+# between two blended moves, a waypoint left at the base origin is refused, and
+# the per-waypoint speed and acceleration scalings are actually applied.
+#
+# Optional parameters:
+#   check_safety_limits (true) - also check the target against the active safety
+#                                planes, joint limits and tool orientation limit,
+#                                not only whether inverse kinematics has a
+#                                solution. This is what catches a pose that is
+#                                reachable but would trip a protective stop.
+
+global cl_v = 0.0
+global cl_a = 0.0
+
+def script():
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  {%- if waypoints | length == 0 %}
+  socket_send_line("This is a trajectory command but no waypoints were given.", "ur_driver_socket")
+  return False
+  {%- endif %}
+
+  socket_send_line("Validating blended linear trajectory of {{ waypoints | length }} waypoints...", "ur_driver_socket")
+
+  # --- PHASE 1: everything that can be checked without moving ---
+  # movel interpolates in Cartesian space, but every endpoint still has to be
+  # reachable, and the arm has to be able to get there without a wrist flip.
+  {%- for wp in waypoints %}
+  {%- if not wp.use_joint_positions %}
+  if point_dist({{ wp.target_in_base }}, p[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) < 0.001:
+    socket_send_line("Waypoint {{ loop.index0 }} has an unset target (base origin). Refusing to move there.", "ur_driver_socket")
+    return False
+  end
+  if not get_inverse_kin_has_solution({{ wp.target_in_base }}
+    {%- if wp.use_preferred_joint_config -%}
+    , qnear={{ wp.preferred_joint_config }}
+    {%- endif -%}):
+    socket_send_line("No inverse kinematics solution for waypoint {{ loop.index0 }}, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- if check_safety_limits | default(value=true) %}
+  if not is_within_safety_limits({{ wp.target_in_base }}):
+    socket_send_line("Waypoint {{ loop.index0 }} is outside the active safety limits, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+  {%- endif %}
+  {%- if not wp.use_blend_radius and not loop.last %}
+  socket_send_line("Waypoint {{ loop.index0 }} has no blend radius, the arm will come to a stop there.", "ur_driver_socket")
+  {%- endif %}
+  {%- endfor %}
+
+  socket_send_line("Validation passed. Starting continuous linear motion.", "ur_driver_socket")
+
+  {%- if report_waypoint_progress %}
+  # Watched from a thread so nothing is written to the socket between two blended
+  # moves. See claude_trajectory_unsafe_move_j.script for why.
+  thread progress_thread():
+    {%- for wp in waypoints %}
+    {%- if wp.use_joint_positions %}
+    while point_dist(get_actual_tcp_pose(), get_forward_kin({{ wp.joint_positions }})) > {% if wp.use_blend_radius %}{{ wp.blend_radius * 1.5 + 0.005 | round(precision=4) }}{% else %}0.005{% endif %}:
+      sleep(0.004)
+    end
+    {%- else %}
+    while point_dist(get_actual_tcp_pose(), {{ wp.target_in_base }}) > {% if wp.use_blend_radius %}{{ wp.blend_radius * 1.5 + 0.005 | round(precision=4) }}{% else %}0.005{% endif %}:
+      sleep(0.004)
+    end
+    {%- endif %}
+    socket_send_line("waypoint_reached {{ loop.index0 }}", "ur_driver_socket")
+    {%- endfor %}
+  end
+  t_progress = run progress_thread()
+  {%- endif %}
+
+  # --- PHASE 2: one uninterrupted block of moves, so the blends survive ---
+  {%- for wp in waypoints %}
+  cl_v = {{ wp.velocity }}
+  cl_a = {{ wp.acceleration }}
+  if {{ wp.global_velocity_scaling }} > 0.0 and {{ wp.global_velocity_scaling }} <= 1.0:
+    cl_v = cl_v * {{ wp.global_velocity_scaling }}
+  end
+  if {{ wp.global_acceleration_scaling }} > 0.0 and {{ wp.global_acceleration_scaling }} <= 1.0:
+    cl_a = cl_a * {{ wp.global_acceleration_scaling }}
+  end
+  {%- if wp.use_joint_positions %}
+  # A joint vector handed to movel means: compute its forward kinematics and move
+  # there in a straight line.
+  movel({{ wp.joint_positions }}, a=cl_a, v=cl_v
+  {%- if wp.use_execution_time -%}
+  , t={{ wp.execution_time }}
+  {%- endif -%}
+  {%- if wp.use_blend_radius -%}
+  , r={{ wp.blend_radius }}
+  {%- endif -%})
+  {%- else %}
+  movel({{ wp.target_in_base }}, a=cl_a, v=cl_v
+  {%- if wp.use_execution_time -%}
+  , t={{ wp.execution_time }}
+  {%- endif -%}
+  {%- if wp.use_blend_radius -%}
+  , r={{ wp.blend_radius }}
+  {%- endif -%})
+  {%- endif %}
+  {%- endfor %}
+
+  {%- if report_waypoint_progress %}
+  sleep(0.05)
+  kill t_progress
+  {%- endif %}
+  return True
+end

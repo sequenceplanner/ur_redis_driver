@@ -1,0 +1,28 @@
+# claude_lock_rsp
+#
+# Locks the RSP tool changer. Identical behaviour to lock_rsp.script, with the
+# pin made a parameter and a readback so a coupler that did not actually engage
+# fails the request instead of being assumed to have worked.
+#
+# Optional parameters:
+#   rsp_pin           (1)     - standard digital output driving the coupler.
+#   rsp_locked_in_pin (-1)    - standard digital *input* reporting "locked".
+#                               -1 means there is no feedback signal and the
+#                               readback is skipped.
+#   rsp_settle_time   (0.5)   - seconds to give the coupler to move.
+#
+# See claude_start_vacuum.script: on the current wiring this pin is also the one
+# start_vacuum.script writes to.
+
+def script():
+  set_standard_digital_out({{ rsp_pin | default(value=1) }}, False)
+  sleep({{ rsp_settle_time | default(value=0.5) }})
+  {%- if rsp_locked_in_pin | default(value=-1) >= 0 %}
+  if not get_standard_digital_in({{ rsp_locked_in_pin | default(value=-1) }}):
+    socket_send_line("RSP did not report locked after {{ rsp_settle_time | default(value=0.5) }}s.", "ur_driver_socket")
+    return False
+  end
+  {%- endif %}
+  socket_send_line("RSP locked", "ur_driver_socket")
+  return True
+end

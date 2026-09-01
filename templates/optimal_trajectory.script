@@ -1,0 +1,118 @@
+# optimal_trajectory
+#
+# Runs a trajectory produced by the Rust planner (`src/trajectory/`). Every
+# waypoint is an explicit joint configuration carrying the velocity and
+# acceleration that its own segment's joint limits allow, plus a blend radius the
+# planner has already checked for overlap.
+#
+# Differences from claude_trajectory_unsafe_move_j.script, and why:
+#
+#   1. No get_inverse_kin / get_inverse_kin_has_solution anywhere. The planner
+#      solved and validated every pose off-robot, against the same URDF the driver
+#      loads, so the controller never runs inverse kinematics for this command.
+#      That removes the branch nondeterminism CLAUDE_TEMPLATES.md documents
+#      ("get_inverse_kin is not guaranteed to return the same branch on two
+#      calls") and roughly halves the rendered script.
+#
+#   2. Phase 1 keeps is_within_safety_limits(), which the script manual (15.1.34)
+#      documents as accepting "Pose or joint positions". Joint limits the planner
+#      already enforced, but safety planes and the tool orientation limit are
+#      installation state it cannot see, so they are still worth checking.
+#
+#   3. No global_velocity_scaling / global_acceleration_scaling block. The planner
+#      bakes scaling into the emitted numbers; applying it again here would square
+#      it. The emitter deliberately sends 0.0 for both.
+#
+#   4. No t= (execution time) branch. Per script manual 14.1.22, t overrides a and
+#      v entirely and is unbounded, so a duration the joints cannot meet faults
+#      rather than saturating. Per-segment v and a are always bounded by
+#      construction.
+#
+#   5. Each waypoint chooses movej or movel through use_linear_motion. A joint
+#      vector handed to movel means "compute its forward kinematics and travel
+#      there in a straight line", which is how a Cartesian-linear segment stays
+#      exactly straight without being resampled.
+#
+# The progress-watcher thread is unchanged from claude_trajectory_unsafe_move_j,
+# so socket_server's WAYPOINT_REACHED_PREFIX and handle_request's resume logic need
+# no changes at all.
+
+def cl_joint_dist(qa, qb):
+  local d = 0.0
+  local i = 0
+  local e = 0.0
+  while i < 6:
+    e = qa[i] - qb[i]
+    if e < 0.0:
+      e = -e
+    end
+    if e > d:
+      d = e
+    end
+    i = i + 1
+  end
+  return d
+end
+
+def script():
+  {%- if use_payload %}
+  set_target_payload({{ payload }})
+  {%- endif %}
+  set_tcp({{ tcp_in_faceplate }})
+
+  {%- if waypoints | length == 0 %}
+  socket_send_line("This is a trajectory command but no waypoints were given.", "ur_driver_socket")
+  return False
+  {%- endif %}
+
+  socket_send_line("Planned trajectory: {{ waypoints | length }} waypoints.", "ur_driver_socket")
+
+  # --- PHASE 1: installation limits the planner cannot see ---
+  {%- for wp in waypoints %}
+  if not is_within_safety_limits({{ wp.joint_positions }}):
+    socket_send_line("Waypoint {{ loop.index0 }} is outside the active safety limits, aborting.", "ur_driver_socket")
+    return False
+  end
+  {%- endfor %}
+
+  socket_send_line("Validation passed. Starting continuous motion.", "ur_driver_socket")
+
+  {%- if report_waypoint_progress %}
+  # Watched from a thread so that nothing is written to the socket between two
+  # blended moves, which would risk flushing the controller's look-ahead and
+  # breaking the blend it is reporting on.
+  thread progress_thread():
+    {%- for wp in waypoints %}
+    while cl_joint_dist(get_actual_joint_positions(), {{ wp.joint_positions }}) > {% if wp.use_blend_radius %}0.08{% else %}0.02{% endif %}:
+      sleep(0.004)
+    end
+    socket_send_line("waypoint_reached {{ loop.index0 }}", "ur_driver_socket")
+    {%- endfor %}
+  end
+  t_progress = run progress_thread()
+  {%- endif %}
+
+  # --- PHASE 2: one uninterrupted block, so the blends survive ---
+  {%- for wp in waypoints %}
+  {%- if wp.use_linear_motion %}
+  movel({{ wp.joint_positions }}, a={{ wp.acceleration }}, v={{ wp.velocity }}
+  {%- if wp.use_blend_radius -%}
+  , r={{ wp.blend_radius }}
+  {%- endif -%})
+  {%- else %}
+  movej({{ wp.joint_positions }}, a={{ wp.acceleration }}, v={{ wp.velocity }}
+  {%- if wp.use_blend_radius -%}
+  , r={{ wp.blend_radius }}
+  {%- endif -%})
+  {%- endif %}
+  {%- endfor %}
+
+  # movej/movel block until the waypoint is reached, so the whole path has run by
+  # here. The short sleep only lets the progress thread publish the last waypoint
+  # before it is killed.
+  {%- if report_waypoint_progress %}
+  sleep(0.05)
+  kill t_progress
+  {%- endif %}
+  return True
+end
