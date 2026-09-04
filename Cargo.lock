@@ -916,7 +916,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "micro_sp"
 version = "0.1.0"
-source = "git+ssh://git@github.com/endre90/micro_sp.git?tag=v0.5.0#dc6ab3fcbb713e310a54740fa644f996a04980c2"
+source = "git+ssh://git@github.com/endre90/micro_sp.git?tag=v0.6.0#fa7896cfb35b422186f82f8663823fe4bc312ece"
 dependencies = [
  "chrono",
  "env_logger",
