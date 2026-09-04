@@ -15,6 +15,21 @@ use ur_redis_driver::{
     state_publisher,
 };
 
+/// A TCP port from the environment, warning and falling back rather than aborting -
+/// a typo in a launcher's .env should not take the driver down.
+fn env_port(name: &str, default: u16, log_target: &str) -> u16 {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().parse::<u16>() {
+            Ok(port) => port,
+            Err(e) => {
+                log::warn!(target: log_target, "{} is not a port number ({}): {}. Using {}.", name, raw, e, default);
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     initialize_env_logger();
     let robot_id = match std::env::var("ROBOT_ID") {
@@ -34,6 +49,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "ur20".to_string()
         }
     };
+    // Namespace for the frames this driver publishes. Empty by default and empty is
+    // exactly the identity, so a single-robot cell keeps publishing the bare
+    // `base_link`..`tool0` its scene files and its model already name.
+    //
+    // Deliberately NOT derived from ROBOT_ID: the existing single-robot run has
+    // ROBOT_ID=r1 and must not start publishing `r1_base_link`. Opt-in only.
+    //
+    // Named UR_TF_PREFIX rather than TF_PREFIX because micro_sp already exports a
+    // `TF_PREFIX` (its Redis key prefix, "tf:") into this scope via `use micro_sp::*`.
+    let tf_prefix = std::env::var("UR_TF_PREFIX").unwrap_or_default();
+    if !tf_prefix.is_empty() {
+        log::info!(target: &log_target, "Publishing robot frames under the prefix '{}'.", tf_prefix);
+    }
+
     let ur_description_dir = match std::env::var("UR_DESCRIPTION_DIR") {
         Ok(id) => id,
         Err(e) => {
@@ -59,8 +88,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "0.0.0.0".to_string()
         }
     };
-    let ur_dashboard_address = format!("{}:29999", ur_address);
-    let ur_address = format!("{}:30003", ur_address);
+    // Both default to the standard UR ports, so a real robot and a single-URSim run
+    // need neither variable. They exist because a second URSim container on the same
+    // host has to publish 29999/30003 on different host ports.
+    let ur_dashboard_port = env_port("UR_DASHBOARD_PORT", 29999, &log_target);
+    let ur_realtime_port = env_port("UR_REALTIME_PORT", 30003, &log_target);
+    let ur_dashboard_address = format!("{}:{}", ur_address, ur_dashboard_port);
+    let ur_address = format!("{}:{}", ur_address, ur_realtime_port);
 
     let mut path_urdf = PathBuf::from(&ur_description_dir);
     let mut path_ur_meshes = PathBuf::from(&ur_description_dir);
@@ -73,6 +107,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut params = URDFParameters::default();
     params.name = robot_id.clone();
+    params.tf_prefix = tf_prefix.clone();
     params.ur_type = robot_model;
     params.description_file = urdf_path.clone();
     params.ur_meshes_path = ur_meshes_path;
@@ -127,6 +162,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command_server = command_server(
         &ur_address,
         &robot_id,
+        &tf_prefix,
         &con_arc,
         shared_state.clone(),
         &local_addr_receiver,
@@ -158,7 +194,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // A readiness marker for whatever supervises this process. Failing to write it
     // says nothing about whether the driver can talk to the robot, so it must not
     // stop startup - this used to be an `.unwrap()`.
-    if let Err(e) = std::fs::File::create("/tmp/robot_controller_ready.flag") {
+    // An env var rather than deriving the name from ROBOT_ID, so the existing
+    // launcher's `rm -f /tmp/robot_controller_ready.flag` keeps matching and only a
+    // two-robot run has to give each driver its own path.
+    let ready_flag = std::env::var("ROBOT_CONTROLLER_READY_FLAG")
+        .unwrap_or_else(|_| "/tmp/robot_controller_ready.flag".to_string());
+    if let Err(e) = std::fs::File::create(&ready_flag) {
         log::warn!(target: &log_target, "Could not write the readiness flag: {}", e);
     }
 

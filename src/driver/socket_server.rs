@@ -6,7 +6,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_util::codec::{Framed, LinesCodec};
 
-use crate::{DriverState, UR_DRIVER_SOCKET_PORT, lock_driver_state};
+use crate::{DriverState, lock_driver_state, ur_driver_socket_port};
 
 /// Prefix of the progress lines the trajectory templates send.
 ///
@@ -24,11 +24,19 @@ pub async fn socket_server(
     }
 
     let mut addr = addr.unwrap();
-    addr.set_port(UR_DRIVER_SOCKET_PORT);
+    let port = ur_driver_socket_port();
+    addr.set_port(port);
 
     println!("Starting socket server at {}", addr);
 
-    let listener = TcpListener::bind(&addr).await?;
+    // The most likely way a second driver on one host fails to start, and a bare
+    // "Address already in use (os error 98)" from main's restart loop says nothing
+    // about which port or how to change it.
+    let listener = TcpListener::bind(&addr).await.map_err(|e| {
+        format!(
+            "could not bind the driver socket server on {addr}: {e}.              Is another ur_redis_driver already using port {port}?              Set UR_DRIVER_SOCKET_PORT to give this one its own."
+        )
+    })?;
     loop {
         // A failed accept is per-connection (the peer went away mid-handshake, the
         // fd table is momentarily full) and says nothing about the listener. `?`

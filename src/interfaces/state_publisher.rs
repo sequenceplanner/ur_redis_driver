@@ -219,8 +219,12 @@ pub async fn initialize_visual_transforms(
             sp_transform.rotation.w = OrderedFloat(qw);
 
             let visual_transform = SPTransformStamped {
-                parent_frame_id: link_name.to_string(),
-                child_frame_id: format!("{}_visual", link_name),
+                // The prefix goes outside the suffix - `r2_shoulder_link_visual`, not
+                // `shoulder_link_r2_visual`. This string is also the RViz marker
+                // namespace, so getting it wrong shows up immediately as two robots'
+                // meshes fighting over one marker.
+                parent_frame_id: robot_params.frame(link_name),
+                child_frame_id: robot_params.frame(&format!("{}_visual", link_name)),
                 transform: sp_transform,
                 active_transform: false,
                 enable_transform: true,
@@ -249,15 +253,23 @@ pub async fn initialize_visual_transforms(
     let _ = TransformsManager::insert_transforms(con, &transforms_to_insert).await;
 }
 
-/// Seed the kinematic frames and hand back what was written, keyed by child
-/// frame id.
+/// Seed the kinematic frames and hand back what was written, keyed by **URDF link
+/// name** - not by the frame id that was written.
 ///
 /// The returned map is the authority on which frames this driver owns and what
 /// their `parent_frame_id` / flags / metadata are. `publish_robot_transforms`
 /// uses it to rebuild a full `SPTransformStamped` per tick without reading the
 /// old one back from Redis first.
+///
+/// The keying is load-bearing. `publish_robot_transforms` looks this map up with the
+/// link names of the `k::Chain`, which come from the URDF and are therefore never
+/// prefixed. So the *keys* stay bare while the `SPTransformStamped` values carry the
+/// prefixed `parent_frame_id` / `child_frame_id` that actually go to Redis. Keying by
+/// `child_frame_id` instead would make every lookup miss the moment a prefix is set,
+/// and because that lookup skips unknown nodes rather than failing, the arm would
+/// simply never move - with nothing logged.
 async fn initialize_robot_transforms(
-    _robot_params: &URDFParameters,
+    robot_params: &URDFParameters,
     con: &mut SPConnection,
 ) -> HashMap<String, SPTransformStamped> {
     let mut transforms_to_insert = vec![];
@@ -281,27 +293,27 @@ async fn initialize_robot_transforms(
         ("flange", "tool0", None, false),
     ];
 
+    // Keyed by the bare URDF link name, valued by the prefixed transform. See the doc
+    // comment above for why those two differ.
+    let mut by_urdf_name = HashMap::new();
+
     for (parent, child, _mesh, _visualize) in relations {
         let initial_transform = SPTransformStamped {
-            // parent_frame_id: format!("{}_{}", robot_params.name, parent), // add this later
-            // child_frame_id: format!("{}_{}", robot_params.name, child), // add this later
-            parent_frame_id: format!("{}", parent),
-            child_frame_id: format!("{}", child),
+            parent_frame_id: robot_params.frame(parent),
+            child_frame_id: robot_params.frame(child),
             transform: SPTransform::default(),
             active_transform: true,
             enable_transform: true,
             time_stamp: SystemTime::now(),
             metadata: MapOrUnknown::UNKNOWN,
         };
+        by_urdf_name.insert(child.to_string(), initial_transform.clone());
         transforms_to_insert.push(initial_transform);
     }
 
     let _ = TransformsManager::insert_transforms(con, &transforms_to_insert).await;
 
-    transforms_to_insert
-        .into_iter()
-        .map(|transform| (transform.child_frame_id.clone(), transform))
-        .collect()
+    by_urdf_name
 }
 
 /// Publish the current kinematic frames as a single `MSET`.
@@ -342,6 +354,10 @@ async fn publish_robot_transforms(
                 None => node.joint().name.clone(),
             };
 
+            // Compared against the *bare* URDF link name on purpose, whatever the tf
+            // prefix is: the scene file owns where the robot base sits (`base_link` is
+            // parented to `stand`), and re-publishing it here would overwrite that and
+            // drop the arm on the floor.
             if frame_name == "base_link" {
                 continue;
             }

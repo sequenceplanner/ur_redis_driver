@@ -1,4 +1,4 @@
-use crate::{RobotCommand, UR_DRIVER_SOCKET_PORT};
+use crate::{RobotCommand, ur_driver_socket_port};
 
 pub fn generate_core_script_from_template(
     robot_name: &str,
@@ -56,7 +56,8 @@ def run_script():
 
     let post_script_2 = format!(
         "    socket_open(\"{}\", {}, \"ur_driver_socket\")",
-        host_address, UR_DRIVER_SOCKET_PORT
+        host_address,
+        ur_driver_socket_port()
     );
 
     let post_script_3 = r#"

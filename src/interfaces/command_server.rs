@@ -17,11 +17,16 @@ pub static SAFE_HOME_JOINT_STATE: [f64; 6] = [0.0, -1.5707, 0.0, -1.5707, 0.0, 0
 pub static DEFAULT_BASEFRAME_ID: &'static str = "base_link"; // base_link if simulation, base if real or ursim
 pub static DEFAULT_FACEPLATE_ID: &'static str = "tool0";
 // pub static DEFAULT_TCP_ID: &'static str = "svt_tcp";
+// Stays bare whatever the tf prefix is: there is one world, and a second station's
+// frames root into it just like the first's.
 pub static DEFAULT_ROOT_FRAME_ID: &'static str = "world";
 
 pub async fn command_server(
     ur_address: &str,
     robot_name: &str,
+    // Namespace for this robot's frames, used only for the `baseframe_id` /
+    // `faceplate_id` fallbacks below. Empty for a single-robot cell.
+    tf_prefix: &str,
     connection_manager: &Arc<ConnectionManager>,
     driver_state: Arc<Mutex<DriverState>>,
     local_addr: &watch::Receiver<Option<SocketAddr>>,
@@ -229,14 +234,18 @@ pub async fn command_server(
                     Payload::default().to_string(),
                     &log_target,
                 );
+                // Prefixed, so a driver whose interface state has not been seeded
+                // falls back to *its own* base and faceplate. Falling back to the bare
+                // names would have the second robot resolving goals against the first
+                // robot's arm and moving to its poses.
                 let baseframe_id = state.get_string_or_value(
                     &key("baseframe_id"),
-                    DEFAULT_BASEFRAME_ID.to_string(),
+                    format!("{}{}", tf_prefix, DEFAULT_BASEFRAME_ID),
                     &log_target,
                 );
                 let faceplate_id = state.get_string_or_value(
                     &key("faceplate_id"),
-                    DEFAULT_FACEPLATE_ID.to_string(),
+                    format!("{}{}", tf_prefix, DEFAULT_FACEPLATE_ID),
                     &log_target,
                 );
                 let goal_feature_id =

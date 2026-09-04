@@ -422,6 +422,22 @@ pub struct URDFParameters {
     pub ur_meshes_path: String
 }
 
+impl URDFParameters {
+    /// This robot's name for a URDF link.
+    ///
+    /// An empty `tf_prefix` returns `name` unchanged, which is what keeps a
+    /// single-robot cell publishing the bare `base_link`..`tool0` that its scene files
+    /// and its model already name. The prefix carries its own separator (`"r2_"`), so
+    /// empty is exactly the identity - do not reintroduce a `format!("{}_{}", ..)`
+    /// here, which cannot express "no prefix".
+    pub fn frame(&self, name: &str) -> String {
+        match self.tf_prefix.is_empty() {
+            true => name.to_string(),
+            false => format!("{}{}", self.tf_prefix, name),
+        }
+    }
+}
+
 impl Default for URDFParameters {
     fn default() -> Self {
         URDFParameters {
@@ -628,4 +644,51 @@ pub fn state_int_or(state: &State, key: &str, default: i64, log_target: &str) ->
         return default;
     }
     state.get_int_or_value(key, default, log_target)
+}
+
+#[cfg(test)]
+mod urdf_parameters_tests {
+    use crate::URDFParameters;
+
+    /// The property the whole single-robot run rests on: with no prefix configured,
+    /// every frame name the driver publishes is the URDF link name unchanged. If this
+    /// breaks, `shared_folder/transforms/base_link.json` and every
+    /// `.baseframe_id("base_link")` in the model stop matching what is in Redis.
+    #[test]
+    fn no_prefix_is_the_identity() {
+        let params = URDFParameters::default();
+        assert_eq!(params.tf_prefix, "");
+        for link in [
+            "base_link",
+            "base_link_inertia",
+            "shoulder_link",
+            "upper_arm_link",
+            "forearm_link",
+            "wrist_1_link",
+            "wrist_2_link",
+            "wrist_3_link",
+            "flange",
+            "ft_frame",
+            "tool0",
+            "shoulder_link_visual",
+        ] {
+            assert_eq!(params.frame(link), link, "'{link}' must survive unchanged");
+        }
+    }
+
+    /// The prefix carries its own separator, so it is a plain concatenation - no
+    /// underscore is inserted and none is assumed.
+    #[test]
+    fn a_prefix_is_concatenated_verbatim() {
+        let mut params = URDFParameters::default();
+        params.tf_prefix = "r2_".to_string();
+        assert_eq!(params.frame("base_link"), "r2_base_link");
+        assert_eq!(params.frame("tool0"), "r2_tool0");
+        // The `_visual` suffix is already part of the name by the time it gets here,
+        // so the prefix lands on the outside where the marker namespace expects it.
+        assert_eq!(
+            params.frame("shoulder_link_visual"),
+            "r2_shoulder_link_visual"
+        );
+    }
 }
